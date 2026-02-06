@@ -1,0 +1,101 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  walletAddress String?
+  password      String? // hashed bcrypt
+  nickname      String?  @unique // unico
+  entries       Entry[]
+  advices       Advice[]
+  payouts       Payout[]
+  emailVerified Boolean @default(false)
+}
+
+model Competition {
+  id           String   @id @default(uuid())
+  type         String // "daily" (futuro: weekly, monthly, six_months)
+  level        String // "basic", "medium", "premium"
+  startAt      DateTime
+  endAt        DateTime
+  status       String   @default("active") // active, pending_approval, closed, cancelled
+  prizePool    Float    @default(0.0)
+  participants Int      @default(0)
+  entries      Entry[]
+}
+
+model Entry {
+  id             String   @id @default(uuid())
+  userId         String
+  competitionId  String?
+  level          String
+  paymentId      String? // ID del pago en NOWPayments
+  status         String   @default("pending") // pending, confirmed, disqualified, winner
+  virtualCapital Float // capital inicial + P&L acumulado
+  createdAt      DateTime @default(now())
+
+  user        User         @relation(fields: [userId], references: [id])
+  competition Competition? @relation(fields: [competitionId], references: [id])
+  positions   Position[] // <--- RELACIÓN NUEVA: trades múltiples
+}
+
+model Advice {
+  id     Int      @id @default(autoincrement())
+  userId String
+  user   User     @relation(fields: [userId], references: [id])
+  date   DateTime @default(now())
+  text   String
+
+  @@index([userId])
+}
+
+model Position {
+  id          String    @id @default(uuid())
+  entry       Entry     @relation(fields: [entryId], references: [id])
+  entryId     String
+  symbol      String
+  direction   String
+  lotSize     Float?
+  entryPrice  Float
+  takeProfit  Float? // opcional
+  stopLoss    Float? // opcional
+  closeReason String? // "manual", "TP_hit", "SL_hit"
+  currentPnl  Float?
+  openedAt    DateTime  @default(now())
+  closedAt    DateTime?
+}
+
+model Payout {
+  id        Int      @id @default(autoincrement())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  level     String
+  position  Int
+  amount    Float
+  date      DateTime @default(now())
+  paymentId String?  // opcional para tracking NOWPayments
+  status    String   @default("pending")  // ← NUEVO CAMPO
+
+  @@index([userId])
+}
+
+model DailyCandle {
+  id        Int      @id @default(autoincrement())
+  symbol    String
+  date      DateTime // fecha del día (00:00 UTC)
+  time      Int      // unix seconds
+  open      Float
+  high      Float
+  low       Float
+  close     Float
+
+  @@unique([symbol, date, time]) // evita duplicados
+  @@index([symbol, date])
+}
