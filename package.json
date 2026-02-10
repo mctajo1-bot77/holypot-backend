@@ -12,6 +12,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "cookie-parser": "^1.4.6",
     "@prisma/client": "^5.22.0",
     "axios": "^1.13.2",
     "bcrypt": "^6.0.0",
