@@ -401,11 +401,25 @@ app.post('/api/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(400).json({ error: "Password incorrect" });
 
+    // ✅ AQUÍ: Buscar la entry más reciente confirmada del usuario (DESPUÉS de obtener user)
+    const entry = await prisma.entry.findFirst({
+      where: { 
+        userId: user.id,
+        status: "confirmed"
+      },
+      orderBy: { id: 'desc' }
+    });
+
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 
     res.cookie('holypotToken', token, getCookieOptions());
 
-    res.json({ success: true, token });
+    // ✅ AQUÍ: Devolver también el entryId
+    res.json({ 
+      success: true, 
+      token,
+      entryId: entry ? entry.id : null
+    });
   } catch (error) {
     res.status(500).json({ error: "Error login", details: error.message });
   }
