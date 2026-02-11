@@ -13,10 +13,12 @@ model User {
   walletAddress String?
   password      String? // hashed bcrypt
   nickname      String?  @unique // unico
+  emailVerified Boolean @default(false)
+  verificationToken  String?  @unique     // ← NUEVO
+  tokenExpiry        DateTime?             // ← NUEVO
   entries       Entry[]
   advices       Advice[]
   payouts       Payout[]
-  emailVerified Boolean @default(false)
 }
 
 model Competition {
