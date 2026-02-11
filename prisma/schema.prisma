@@ -74,18 +74,16 @@ model Position {
 
 model Payout {
   id        Int      @id @default(autoincrement())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id])
+  userId    Int
   level     String
   position  Int
   amount    Float
   date      DateTime @default(now())
-  paymentId String?  // opcional para tracking NOWPayments
-  status    String   @default("pending")  // ← NUEVO CAMPO
-
-  @@index([userId])
+  status    String   @default("pending")  // pending, sent, confirmed, failed
+  paymentId String?                        // NowPayments payout ID
+  
+  user      User     @relation(fields: [userId], references: [id])
 }
-
 model DailyCandle {
   id        Int      @id @default(autoincrement())
   symbol    String
