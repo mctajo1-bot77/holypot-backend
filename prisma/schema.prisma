@@ -74,7 +74,7 @@ model Position {
 
 model Payout {
   id        Int      @id @default(autoincrement())
-  userId    Int
+  userId    String
   level     String
   position  Int
   amount    Float
