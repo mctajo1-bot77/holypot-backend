@@ -51,6 +51,58 @@ const levelsConfig = {
   premium: { name: "Premium", entryPrice: 107, comision: 7, initialCapital: 100000 }
 };
 
+// 🆕 FUNCIÓN: Obtener balance real de NowPayments
+async function getNowPaymentsBalance() {
+  try {
+    const response = await axios.get(`${NOWPAYMENTS_API}/balance`, {
+      headers: { 'x-api-key': API_KEY }
+    });
+    
+    // NowPayments devuelve balance por moneda
+    // Buscamos USDT TRC20
+    const currencies = response.data.currencies || [];
+    const usdtBalance = currencies.find(c => c.currency === 'usdttrc20');
+    
+    return usdtBalance ? parseFloat(usdtBalance.available_balance || 0) : 0;
+  } catch (error) {
+    console.error('❌ Error obteniendo balance NowPayments:', error.response?.data || error.message);
+    return 0;
+  }
+}
+
+// 🆕 FUNCIÓN: Enviar pago automático vía NowPayments
+async function sendNowPaymentsPayout(walletAddress, amount, level, position) {
+  try {
+    const response = await axios.post(`${NOWPAYMENTS_API}/payout`, {
+      withdrawals: [{
+        address: walletAddress,
+        currency: 'usdttrc20',
+        amount: amount.toFixed(2),
+        ipn_callback_url: `${process.env.BACKEND_URL || 'https://holypot-backend.onrender.com'}/api/webhook-payout`
+      }]
+    }, {
+      headers: {
+        'x-api-key': API_KEY,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    console.log(`✅ Pago enviado a ${walletAddress}: ${amount} USDT - Response:`, response.data);
+    
+    return {
+      success: true,
+      paymentId: response.data.id || response.data.withdrawals?.[0]?.id,
+      data: response.data
+    };
+  } catch (error) {
+    console.error('❌ Error enviando payout NowPayments:', error.response?.data || error.message);
+    return {
+      success: false,
+      error: error.response?.data || error.message
+    };
+  }
+}
+
 // Finnhub WebSocket real-time prices
 const livePrices = {};
 
@@ -483,7 +535,32 @@ app.post('/api/webhook-nowpayments', express.raw({type: 'application/json'}), as
   }
 });
 
-// Competencias activas
+// 🆕 Webhook NowPayments PAYOUT (confirmación de pagos enviados)
+app.post('/api/webhook-payout', express.raw({type: 'application/json'}), async (req, res) => {
+  const body = req.body.toString();
+  
+  try {
+    const data = JSON.parse(body);
+    console.log('📥 Webhook payout recibido:', data);
+    
+    if (data.status === 'FINISHED' || data.status === 'COMPLETED') {
+      // Actualizar payout en DB como confirmado
+      await prisma.payout.updateMany({
+        where: { paymentId: data.id || data.withdrawal_id },
+        data: { status: 'confirmed' }
+      });
+      
+      console.log('✅ Payout confirmado en blockchain');
+    }
+    
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('Error webhook payout:', error);
+    res.status(400).send('Invalid');
+  }
+});
+
+// 🆕 Competencias activas CON BALANCE REAL de NowPayments
 app.get('/api/competitions/active', async (req, res) => {
   try {
     const entries = await prisma.entry.findMany({
@@ -491,12 +568,16 @@ app.get('/api/competitions/active', async (req, res) => {
       include: { user: true }
     });
 
+    // Obtener balance REAL de NowPayments
+    const realBalance = await getNowPaymentsBalance();
+    console.log(`💰 Balance real NowPayments: ${realBalance} USDT`);
+
     const competitions = Object.entries(levelsConfig).map(([level, config]) => {
       const confirmed = entries.filter(e => e.level === level);
       const participants = confirmed.length;
       const ingresos = participants * config.entryPrice;
       const revenue = participants * config.comision;
-      const prizePool = ingresos - revenue;
+      const prizePoolTeorico = ingresos - revenue;
 
       const now = new Date();
       const utcNow = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds());
@@ -511,7 +592,8 @@ app.get('/api/competitions/active', async (req, res) => {
         entryPrice: config.entryPrice,
         initialCapital: config.initialCapital,
         participants,
-        prizePool,
+        prizePool: prizePoolTeorico, // Teórico (sin descontar comisión NowPayments)
+        prizePoolReal: realBalance, // Real disponible en NowPayments
         timeLeft: `${hoursLeft}h ${minutesLeft}m`
       };
     });
@@ -1303,9 +1385,9 @@ app.get('/', (req, res) => res.json({ message: 'Holypot Trading corriendo! 🚀'
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`Servidor en http://localhost:${PORT}`));
 
-// CRON CIERRE DIARIO 21:00 UTC + ROLLOVER + CONSEJOS IA + LIMPIEZA VELAS
+// 🆕 CRON CIERRE DIARIO 21:00 UTC + PAGOS AUTOMÁTICOS + ROLLOVER + CONSEJOS IA + LIMPIEZA VELAS
 cron.schedule('0 21 * * *', async () => {
-  console.log('🔥 CRON 21:00 UTC – Cierre competencia diaria + rollover + consejos IA + limpieza velas');
+  console.log('🔥 CRON 21:00 UTC – Cierre competencia diaria + PAGOS AUTOMÁTICOS + rollover + consejos IA + limpieza velas');
 
   try {
     const entriesToday = await prisma.entry.findMany({
@@ -1366,24 +1448,51 @@ cron.schedule('0 21 * * *', async () => {
 
       const prizes = [0.5, 0.3, 0.2];
 
-      // GUARDAR PREMIO HISTÓRICO + LOG
+      // 🆕 ENVIAR PAGOS AUTOMÁTICOS + GUARDAR EN DB
       for (let i = 0; i < Math.min(3, finalRanking.length); i++) {
         const winner = finalRanking[i];
         const prizeAmount = prizePool * prizes[i];
+        const walletAddress = winner.entry.user.walletAddress;
 
-        await prisma.payout.create({
-          data: {
-            userId: winner.entry.userId,
-            level: level,
-            position: i + 1,
-            amount: prizeAmount
-          }
-        });
+        if (!walletAddress) {
+          console.log(`⚠️ ${i+1}º ${level.toUpperCase()}: Usuario sin wallet – premio NO enviado`);
+          continue;
+        }
 
-        console.log(`🏆 ${i+1}º ${level.toUpperCase()}: ${winner.entry.user.nickname || winner.entry.user.email} – Premio ${prizeAmount.toFixed(2)} USDT guardado`);
+        // 🆕 ENVIAR PAGO VÍA NOWPAYMENTS
+        const payoutResult = await sendNowPaymentsPayout(walletAddress, prizeAmount, level, i + 1);
+
+        if (payoutResult.success) {
+          // Guardar en DB con paymentId
+          await prisma.payout.create({
+            data: {
+              userId: winner.entry.userId,
+              level: level,
+              position: i + 1,
+              amount: prizeAmount,
+              status: 'sent', // pending → sent → confirmed (webhook)
+              paymentId: payoutResult.paymentId || null
+            }
+          });
+
+          console.log(`✅ ${i+1}º ${level.toUpperCase()}: ${winner.entry.user.nickname || winner.entry.user.email} – ${prizeAmount.toFixed(2)} USDT ENVIADO a ${walletAddress}`);
+        } else {
+          console.error(`❌ ${i+1}º ${level.toUpperCase()}: Error enviando pago – ${payoutResult.error}`);
+          
+          // Guardar en DB como fallido
+          await prisma.payout.create({
+            data: {
+              userId: winner.entry.userId,
+              level: level,
+              position: i + 1,
+              amount: prizeAmount,
+              status: 'failed'
+            }
+          });
+        }
       }
 
-      console.log(`✅ Competencia ${level.toUpperCase()} cerrada`);
+      console.log(`✅ Competencia ${level.toUpperCase()} cerrada + pagos procesados`);
     }
 
     // LIMPIEZA AUTOMÁTICA VELAS DE AYER
