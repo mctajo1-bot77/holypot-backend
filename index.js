@@ -12,8 +12,61 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const z = require('zod');
 const cookieParser = require('cookie-parser');
+const { Resend } = require('resend');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'holypotsecret2026';
+
+// ========== EMAIL VERIFICATION SETUP ==========
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+// Función para generar token
+function generateVerificationToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+// Función para enviar email
+async function sendVerificationEmail(email, token) {
+  const verificationUrl = `${process.env.FRONTEND_URL}/verify-email?token=${token}`;
+  
+  try {
+    const { data, error } = await resend.emails.send({
+      from: 'Holypot <onboarding@resend.dev>',
+      to: email,
+      subject: '🎯 Confirma tu email - Holypot',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h1 style="color: #667eea; text-align: center;">🎯 Holypot</h1>
+          <h2>¡Bienvenido!</h2>
+          <p>Confirma tu email para comenzar a competir:</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${verificationUrl}" style="background: #667eea; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
+              ✅ Confirmar Email
+            </a>
+          </div>
+          <p style="color: #666; font-size: 14px;">
+            O copia este enlace:<br>
+            <code>${verificationUrl}</code>
+          </p>
+          <p style="color: #999; font-size: 12px; margin-top: 30px;">
+            Este enlace expira en 24 horas.
+          </p>
+        </div>
+      `
+    });
+
+    if (error) {
+      console.error('❌ Error enviando email:', error);
+      return { success: false, error };
+    }
+
+    console.log('✅ Email enviado:', data);
+    return { success: true, data };
+  } catch (error) {
+    console.error('❌ Error:', error);
+    return { success: false, error: error.message };
+  }
+}
+// =============================================
 
 const app = express();
 app.set('trust proxy', 1);
@@ -394,45 +447,141 @@ app.post('/api/logout', (req, res) => {
   res.json({ success: true });
 });
 
-// REGISTER
+// ========== ENDPOINTS DE EMAIL VERIFICATION ==========
+
+// REGISTRO CON VERIFICACIÓN
 app.post('/api/register', async (req, res) => {
-  const schema = z.object({
-    email: z.string().email(),
-    password: z.string().min(8),
-    walletAddress: z.string(),
-    nickname: z.string().min(3)
-  });
-
-  const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
-
-  const { email, password, walletAddress, nickname } = parsed.data;
-
   try {
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const { email, password, nickname } = req.body;
 
-    const existingNick = await prisma.user.findUnique({ where: { nickname } });
-    if (existingNick) return res.status(400).json({ error: "Nickname ya usado – elige otro" });
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email y contraseña requeridos' });
+    }
+
+    const existingUser = await prisma.user.findUnique({ where: { email } });
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email ya registrado' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const verificationToken = generateVerificationToken();
+    const tokenExpiry = new Date();
+    tokenExpiry.setHours(tokenExpiry.getHours() + 24);
 
     const user = await prisma.user.create({
       data: {
         email,
         password: hashedPassword,
-        walletAddress,
         nickname,
-        emailVerified: false
+        emailVerified: false,
+        verificationToken,
+        tokenExpiry
       }
     });
 
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    const emailResult = await sendVerificationEmail(email, verificationToken);
 
-    res.cookie('holypotToken', token, getCookieOptions());
-
-    res.json({ success: true, token });
+    res.status(201).json({
+      message: 'Registro exitoso. Revisa tu email.',
+      userId: user.id,
+      emailSent: emailResult.success
+    });
   } catch (error) {
-    res.status(500).json({ error: "Error register", details: error.message });
+    console.error('Error en registro:', error);
+    res.status(500).json({ error: 'Error en el registro' });
   }
 });
+
+// VERIFICAR EMAIL
+app.get('/api/verify-email', async (req, res) => {
+  try {
+    const { token } = req.query;
+
+    if (!token) {
+      return res.status(400).json({ error: 'Token no proporcionado' });
+    }
+
+    const user = await prisma.user.findFirst({
+      where: {
+        verificationToken: token,
+        emailVerified: false,
+        tokenExpiry: { gt: new Date() }
+      }
+    });
+
+    if (!user) {
+      return res.status(400).json({ 
+        error: 'Token inválido o expirado',
+        code: 'INVALID_TOKEN'
+      });
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        emailVerified: true,
+        verificationToken: null,
+        tokenExpiry: null
+      }
+    });
+
+    console.log(`✅ Email verificado: ${user.email}`);
+
+    res.json({
+      success: true,
+      message: '¡Email verificado!'
+    });
+  } catch (error) {
+    console.error('Error verificando email:', error);
+    res.status(500).json({ error: 'Error al verificar' });
+  }
+});
+
+// REENVIAR VERIFICACIÓN
+app.post('/api/resend-verification', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email requerido' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } });
+
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    if (user.emailVerified) {
+      return res.status(400).json({ error: 'Email ya verificado' });
+    }
+
+    const verificationToken = generateVerificationToken();
+    const tokenExpiry = new Date();
+    tokenExpiry.setHours(tokenExpiry.getHours() + 24);
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { verificationToken, tokenExpiry }
+    });
+
+    const emailResult = await sendVerificationEmail(email, verificationToken);
+
+    if (!emailResult.success) {
+      return res.status(500).json({ error: 'Error enviando email' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Email reenviado'
+    });
+  } catch (error) {
+    console.error('Error reenviando:', error);
+    res.status(500).json({ error: 'Error' });
+  }
+});
+
+// =====================================================
 
 // Login normal
 app.post('/api/login', async (req, res) => {
