@@ -870,7 +870,7 @@ app.post('/api/manual-confirm', async (req, res) => {
   }
 });
 
-// OPEN TRADE
+// OPEN TRADE - Actualizado con validación de riesgo real
 app.post('/api/open-trade', authenticateToken, async (req, res) => {
   const { entryId, symbol, direction, lotSize, takeProfit, stopLoss } = req.body;
   const dir = direction.toLowerCase();
@@ -907,6 +907,47 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
       if (dir === 'short' && sl <= currentPrice) return res.status(400).json({ error: "SL debe ser mayor al precio actual en SHORT" });
     }
 
+    // ✅ VALIDACIÓN DE RIESGO REAL
+    // Configuración de instrumentos (copiar esto al inicio del archivo o importar desde config)
+    const instrumentConfig = {
+      'EURUSD': { pipValue: 10, pipMultiplier: 10000, displayName: 'EUR/USD' },
+      'GBPUSD': { pipValue: 10, pipMultiplier: 10000, displayName: 'GBP/USD' },
+      'USDJPY': { pipValue: 9.09, pipMultiplier: 100, displayName: 'USD/JPY' },
+      'XAUUSD': { pipValue: 10, pipMultiplier: 10, displayName: 'Gold' },
+      'SPX500': { pipValue: 50, pipMultiplier: 1, displayName: 'S&P 500' },
+      'NAS100': { pipValue: 20, pipMultiplier: 1, displayName: 'NASDAQ 100' }
+    };
+
+    const config = instrumentConfig[symbol] || instrumentConfig['EURUSD'];
+    
+    // Calcular distancia en pips/puntos
+    const slPrice = stopLoss ? parseFloat(stopLoss) : null;
+    const distancePips = slPrice 
+      ? Math.abs(currentPrice - slPrice) * config.pipMultiplier
+      : 100; // Default: asume 100 pips si no hay SL (riesgo máximo estimado)
+    
+    // Calcular riesgo en USD y porcentaje
+    const riskUSD = distancePips * config.pipValue * lotSize;
+    const riskPercent = (riskUSD / entry.virtualCapital) * 100;
+
+    // Bloquear si el riesgo excede el 10%
+    if (riskPercent > 10) {
+      return res.status(400).json({ 
+        error: `Riesgo ${riskPercent.toFixed(1)}% excede máximo 10%. Reduce lotSize o ajusta SL.`,
+        details: {
+          riskPercent: riskPercent.toFixed(2),
+          riskUSD: riskUSD.toFixed(2),
+          distancePips: Math.round(distancePips),
+          symbol: symbol,
+          currentPrice: currentPrice,
+          stopLoss: slPrice,
+          lotSize: lotSize,
+          virtualCapital: entry.virtualCapital
+        }
+      });
+    }
+
+    // ✅ Crear la posición (incluyendo datos de riesgo calculados)
     await prisma.position.create({
       data: {
         entryId,
@@ -915,18 +956,27 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
         lotSize,
         entryPrice: currentPrice,
         takeProfit: takeProfit ? parseFloat(takeProfit) : null,
-        stopLoss: stopLoss ? parseFloat(stopLoss) : null
+        stopLoss: stopLoss ? parseFloat(stopLoss) : null,
+        // Opcional: guardar el riesgo calculado para referencia
+        // calculatedRiskPercent: riskPercent,
+        // calculatedRiskUSD: riskUSD
       }
     });
 
     emitLiveData();
 
-    res.json({ message: `¡Trade abierto! ${dir.toUpperCase()} ${symbol} ${lotSize} lot a ${currentPrice.toFixed(2)}` });
+    res.json({ 
+      message: `¡Trade abierto! ${dir.toUpperCase()} ${symbol} ${lotSize} lot a ${currentPrice.toFixed(2)}`,
+      riskInfo: {
+        riskPercent: riskPercent.toFixed(2),
+        riskUSD: riskUSD.toFixed(2),
+        distancePips: Math.round(distancePips)
+      }
+    });
   } catch (error) {
     res.status(500).json({ error: "Error open trade", details: error.message });
   }
 });
-
 // CLOSE TRADE
 app.post('/api/close-trade', authenticateToken, async (req, res) => {
   const { positionId } = req.body;
