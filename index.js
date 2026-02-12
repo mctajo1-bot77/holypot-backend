@@ -869,7 +869,6 @@ app.post('/api/manual-confirm', async (req, res) => {
     res.status(500).json({ error: "Error manual confirm", details: error.message });
   }
 });
-
 // OPEN TRADE - Actualizado con validación de riesgo real
 app.post('/api/open-trade', authenticateToken, async (req, res) => {
   const { entryId, symbol, direction, lotSize, takeProfit, stopLoss } = req.body;
