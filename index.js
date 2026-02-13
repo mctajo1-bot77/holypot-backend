@@ -4,6 +4,7 @@ const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const axios = require('axios');
 const http = require('http');
+const { Server } = require('socket.io');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const WebSocket = require('ws');
@@ -69,6 +70,14 @@ async function sendVerificationEmail(email, token) {
 // =============================================
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    credentials: true
+  }
+});
+
 app.set('trust proxy', 1);
 app.use(cookieParser());
 app.use(cors({
@@ -161,6 +170,10 @@ async function sendNowPaymentsPayout(walletAddress, amount, level, position) {
 const livePrices = {};
 let socketFinnhub = null;
 let reconnectTimeout = null;
+
+function getCurrentPrice(symbol) {
+  return livePrices[symbol] || null;
+}
 
 // Función para conectar/reconectar Finnhub WebSocket
 function connectFinnhub() {
@@ -342,13 +355,16 @@ function authenticateAdmin(req, res, next) {
 // /api/me
 app.get('/api/me', authenticateToken, async (req, res) => {
   try {
+    const isAdmin = req.user.role === 'admin';
+    if (isAdmin) {
+      return res.json({ user: { id: null, email: req.user.email, nickname: 'Admin', walletAddress: null, role: 'admin' } });
+    }
     const user = await prisma.user.findUnique({
       where: { id: req.user.userId },
       select: { id: true, email: true, nickname: true, walletAddress: true }
     });
     if (!user) return res.status(404).json({ error: "User not found" });
-    const isAdmin = req.user.role === 'admin';
-    res.json({ user: { ...user, role: isAdmin ? 'admin' : 'user' } });
+    res.json({ user: { ...user, role: 'user' } });
   } catch (error) {
     console.error('Error /api/me:', error);
     res.status(500).json({ error: "Error interno" });
@@ -1598,7 +1614,7 @@ app.get('/api/candles/:symbol', async (req, res) => {
 app.get('/', (req, res) => res.json({ message: 'Holypot Trading corriendo! 🚀' }));
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Servidor en http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`Servidor en http://localhost:${PORT}`));
 
 // 🆕 CRON CIERRE DIARIO 21:00 UTC + PAGOS AUTOMÁTICOS + ROLLOVER + CONSEJOS IA + LIMPIEZA VELAS
 cron.schedule('0 21 * * *', async () => {
