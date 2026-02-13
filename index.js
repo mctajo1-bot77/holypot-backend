@@ -1598,7 +1598,7 @@ app.get('/api/candles/:symbol', async (req, res) => {
 app.get('/', (req, res) => res.json({ message: 'Holypot Trading corriendo! 🚀' }));
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Servidor en http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Servidor en http://localhost:${PORT}`));
 
 // 🆕 CRON CIERRE DIARIO 21:00 UTC + PAGOS AUTOMÁTICOS + ROLLOVER + CONSEJOS IA + LIMPIEZA VELAS
 cron.schedule('0 21 * * *', async () => {
