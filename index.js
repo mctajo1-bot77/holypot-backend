@@ -157,111 +157,128 @@ async function sendNowPaymentsPayout(walletAddress, amount, level, position) {
 }
 
 // Finnhub WebSocket real-time prices
+// ========== FINNHUB WEBSOCKET CON RECONEXIÓN MEJORADA ==========
 const livePrices = {};
+let socketFinnhub = null;
+let reconnectTimeout = null;
 
-const socketFinnhub = new WebSocket(`wss://ws.finnhub.io?token=${process.env.FINNHUB_API_KEY}`);
+// Función para conectar/reconectar Finnhub WebSocket
+function connectFinnhub() {
+  // Limpiar timeout anterior si existe
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
 
-socketFinnhub.on('open', () => {
-  console.log('Finnhub WebSocket conectado – suscribiendo activos 🚀');
+  console.log('🔌 Conectando a Finnhub WebSocket...');
+  
+  socketFinnhub = new WebSocket(`wss://ws.finnhub.io?token=${process.env.FINNHUB_API_KEY}`);
 
-  const symbols = {
-    EURUSD: 'EUR_USD',
-    GBPUSD: 'GBP_USD',
-    USDJPY: 'USD_JPY',
-    XAUUSD: 'XAU_USD',
-    SPX500: 'SPX500',
-    NAS100: 'NAS100'
-  };
+  socketFinnhub.on('open', () => {
+    console.log('✅ Finnhub WebSocket CONECTADO – suscribiendo activos 🚀');
 
-  Object.keys(symbols).forEach(key => {
-    const finnhubSym = symbols[key];
-    socketFinnhub.send(JSON.stringify({ type: 'subscribe', symbol: `OANDA:${finnhubSym}` }));
-    console.log(`Suscripto a OANDA:${finnhubSym}`);
+    const symbols = {
+      EURUSD: 'EUR_USD',
+      GBPUSD: 'GBP_USD',
+      USDJPY: 'USD_JPY',
+      XAUUSD: 'XAU_USD',
+      SPX500: 'SPX500',
+      NAS100: 'NAS100'
+    };
+
+    Object.keys(symbols).forEach((key, index) => {
+      setTimeout(() => {
+        const finnhubSym = symbols[key];
+        socketFinnhub.send(JSON.stringify({ type: 'subscribe', symbol: `OANDA:${finnhubSym}` }));
+        console.log(`📊 Suscripto a OANDA:${finnhubSym}`);
+      }, index * 200); // 200ms entre cada suscripción (evitar rate limit)
+    });
   });
-});
 
-socketFinnhub.on('message', async (data) => {
-  const msg = JSON.parse(data);
-  if (msg.type === 'trade' && msg.data) {
-    for (const t of msg.data) {
-      let fullSym = t.s;
-      let symbol = fullSym.replace('OANDA:', '');
-      symbol = symbol.replace('_USD', 'USD').replace('_JPY', 'JPY');
-      const price = t.p;
-      livePrices[symbol] = price;
+  socketFinnhub.on('message', async (data) => {
+    const msg = JSON.parse(data);
+    
+    // Log de datos recibidos (solo primeros 100 caracteres)
+    console.log('📥 Finnhub mensaje:', data.toString().substring(0, 100));
+    
+    if (msg.type === 'trade' && msg.data) {
+      for (const t of msg.data) {
+        let fullSym = t.s;
+        let symbol = fullSym.replace('OANDA:', '');
+        symbol = symbol.replace('_USD', 'USD').replace('_JPY', 'JPY');
+        const price = t.p;
+        
+        console.log(`💰 Precio actualizado: ${symbol} = ${price}`);
+        livePrices[symbol] = price;
 
-      const nowSec = Math.floor(Date.now() / 1000);
-      const currentMinute = Math.floor(nowSec / 60) * 60;
+        const nowSec = Math.floor(Date.now() / 1000);
+        const currentMinute = Math.floor(nowSec / 60) * 60;
 
-      const candleDate = new Date(currentMinute * 1000);
-      candleDate.setUTCHours(0, 0, 0, 0);
+        const candleDate = new Date(currentMinute * 1000);
+        candleDate.setUTCHours(0, 0, 0, 0);
 
-      try {
-        const existing = await prisma.dailyCandle.findUnique({
-          where: {
-            symbol_date_time: {
-              symbol: symbol.toUpperCase(),
-              date: candleDate,
-              time: currentMinute
-            }
-          }
-        });
-
-        if (existing) {
-          await prisma.dailyCandle.update({
+        try {
+          const existing = await prisma.dailyCandle.findUnique({
             where: {
               symbol_date_time: {
                 symbol: symbol.toUpperCase(),
                 date: candleDate,
                 time: currentMinute
               }
-            },
-            data: {
-              high: Math.max(existing.high, price),
-              low: Math.min(existing.low, price),
-              close: price
             }
           });
-        } else {
-          await prisma.dailyCandle.create({
-            data: {
-              symbol: symbol.toUpperCase(),
-              date: candleDate,
-              time: currentMinute,
-              open: price,
-              high: price,
-              low: price,
-              close: price
-            }
-          });
+
+          if (existing) {
+            await prisma.dailyCandle.update({
+              where: {
+                symbol_date_time: {
+                  symbol: symbol.toUpperCase(),
+                  date: candleDate,
+                  time: currentMinute
+                }
+              },
+              data: {
+                high: Math.max(existing.high, price),
+                low: Math.min(existing.low, price),
+                close: price
+              }
+            });
+          } else {
+            await prisma.dailyCandle.create({
+              data: {
+                symbol: symbol.toUpperCase(),
+                date: candleDate,
+                time: currentMinute,
+                open: price,
+                high: price,
+                low: price,
+                close: price
+              }
+            });
+          }
+        } catch (err) {
+          console.error('Error vela 1min:', err);
         }
-      } catch (err) {
-        console.error('Error vela 1min:', err);
       }
+      emitLiveData();
     }
-    emitLiveData();
-  }
-});
+  });
 
-socketFinnhub.on('error', (err) => console.error('Finnhub WS error:', err));
-socketFinnhub.on('close', () => {
-  console.warn('Finnhub WS cerrado – reconectando en 5s');
-  setTimeout(() => new WebSocket(`wss://ws.finnhub.io?token=${process.env.FINNHUB_API_KEY}`), 5000);
-});
+  socketFinnhub.on('error', (err) => {
+    console.error('❌ Finnhub WS ERROR:', err.message);
+  });
 
-function getCurrentPrice(symbol) {
-  return livePrices[symbol] || null;
+  socketFinnhub.on('close', () => {
+    console.warn('⚠️ Finnhub WS CERRADO – reconectando en 5s...');
+    reconnectTimeout = setTimeout(() => {
+      connectFinnhub(); // ✅ Reconectar llamando a la misma función
+    }, 5000);
+  });
 }
 
-const server = http.createServer(app);
-const { Server } = require("socket.io");
-const io = new Server(server, {
-  cors: {
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
-    methods: ["GET", "POST"],
-    credentials: true
-  }
-});
+// ✅ Conectar al inicio
+connectFinnhub();
+// ================================================================
 
 // RATE LIMITING
 const loginLimiter = rateLimit({
