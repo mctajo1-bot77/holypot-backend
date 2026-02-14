@@ -742,6 +742,26 @@ app.post('/api/webhook-payout', express.raw({type: 'application/json'}), async (
   }
 });
 
+// ADMIN PAYOUTS - Lista todos los pagos del sistema
+app.get('/api/admin/payouts', authenticateAdmin, async (req, res) => {
+  try {
+    const payouts = await prisma.payout.findMany({
+      include: {
+        user: {
+          select: { email: true, nickname: true }
+        }
+      },
+      orderBy: { date: 'desc' },
+      take: 100 // Últimos 100 pagos
+    });
+    
+    res.json(payouts);
+  } catch (err) {
+    console.error('Error admin payouts:', err);
+    res.status(500).json({ error: 'Error cargando payouts' });
+  }
+});
+
 // 🆕 Competencias activas CON BALANCE REAL de NowPayments
 app.get('/api/competitions/active', async (req, res) => {
   try {
