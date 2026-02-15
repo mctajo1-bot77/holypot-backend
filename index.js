@@ -687,6 +687,32 @@ app.get('/api/admin-login', (req, res) => {
   res.status(405).json({ error: "Método GET no permitido – usa POST para login admin" });
 });
 
+// ADMIN: Generar token de usuario para impersonación (Ver como usuario)
+app.post('/api/admin/generate-user-token', authenticateAdmin, async (req, res) => {
+  const { entryId } = req.body;
+  if (!entryId) return res.status(400).json({ error: "entryId requerido" });
+
+  try {
+    const entry = await prisma.entry.findUnique({
+      where: { id: entryId },
+      include: { user: { select: { id: true, email: true } } }
+    });
+
+    if (!entry) return res.status(404).json({ error: "Entry no encontrada" });
+    if (!entry.user) return res.status(404).json({ error: "Usuario no encontrado para esta entry" });
+
+    const userToken = jwt.sign(
+      { userId: entry.user.id, email: entry.user.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({ success: true, token: userToken, entryId: entry.id });
+  } catch (error) {
+    res.status(500).json({ error: "Error generando token de usuario", details: error.message });
+  }
+});
+
 // Webhook NowPayments
 app.post('/api/webhook-nowpayments', express.raw({type: 'application/json'}), async (req, res) => {
   const body = req.body.toString();
