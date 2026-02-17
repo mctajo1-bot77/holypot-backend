@@ -315,11 +315,13 @@ function connectFinnhub() {
 connectFinnhub();
 // ================================================================
 
-// RATE LIMITING
+// ========== RATE LIMITING – TODOS LOS ENDPOINTS CRÍTICOS ==========
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
-  message: 'Demasiados intentos – espera 15 min'
+  message: { error: 'Demasiados intentos de login – espera 15 min' },
+  standardHeaders: true,
+  legacyHeaders: false
 });
 app.use('/api/login', loginLimiter);
 app.use('/api/admin-login', loginLimiter);
@@ -327,9 +329,42 @@ app.use('/api/admin-login', loginLimiter);
 const tradeLimiter = rateLimit({
   windowMs: 1000,
   max: 3,
-  message: 'Demasiados trades rápidos – espera'
+  message: { error: 'Demasiados trades rápidos – espera' },
+  standardHeaders: true,
+  legacyHeaders: false
 });
 app.use('/api/open-trade', tradeLimiter);
+app.use('/api/close-trade', tradeLimiter);
+app.use('/api/edit-position', tradeLimiter);
+
+const paymentLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 3,
+  message: { error: 'Demasiadas solicitudes de pago – espera 1 min' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use('/api/create-payment', paymentLimiter);
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  message: { error: 'Demasiados registros – espera 1 hora' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use('/api/register', registerLimiter);
+app.use('/api/resend-verification', registerLimiter);
+
+const apiGeneralLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: { error: 'Demasiadas solicitudes – espera un momento' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use('/api/', apiGeneralLimiter);
+// ==================================================================
 
 // Helper: Extraer token de Authorization header O cookie
 function getToken(req) {
