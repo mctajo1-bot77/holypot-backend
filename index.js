@@ -1657,6 +1657,180 @@ app.get('/api/candles/:symbol', async (req, res) => {
   }
 });
 
+// ── DIAGNOSTICO NOWPayments (admin) ──────────────────────────────
+app.get('/api/admin/nowpayments-status', authenticateAdmin, async (req, res) => {
+  const results = { timestamp: new Date().toISOString(), api: {}, balance: {}, competitions: {}, entries: {}, payouts: {}, discrepancies: [] };
+
+  // 1. API connectivity
+  try {
+    const status = await axios.get(`${NOWPAYMENTS_API}/status`, { headers: { 'x-api-key': API_KEY } });
+    results.api = { connected: true, message: status.data?.message };
+  } catch (err) {
+    results.api = { connected: false, error: err.response?.data?.message || err.message, httpStatus: err.response?.status };
+    return res.json(results);
+  }
+
+  // 2. Balance real
+  try {
+    const balRes = await axios.get(`${NOWPAYMENTS_API}/balance`, { headers: { 'x-api-key': API_KEY } });
+    const currencies = balRes.data?.currencies || [];
+    const usdt = currencies.find(c => c.currency === 'usdttrc20');
+    results.balance = {
+      usdtAvailable: usdt ? parseFloat(usdt.available_balance || 0) : 0,
+      usdtPending: usdt ? parseFloat(usdt.pending_balance || 0) : 0,
+      allCurrencies: currencies.map(c => ({ currency: c.currency, available: parseFloat(c.available_balance || 0) }))
+    };
+  } catch (err) {
+    results.balance = { error: err.response?.data?.message || err.message };
+  }
+
+  // 3. Competencias activas con pools
+  try {
+    const confirmed = await prisma.entry.findMany({ where: { status: 'confirmed' } });
+    let totalTeorico = 0;
+    const comps = {};
+
+    for (const [level, config] of Object.entries(levelsConfig)) {
+      const count = confirmed.filter(e => e.level === level).length;
+      const ingresos = count * config.entryPrice;
+      const comision = count * config.comision;
+      const pool = ingresos - comision;
+      totalTeorico += pool;
+      comps[level] = { participants: count, ingresos, platformFee: comision, prizePoolTeorico: pool };
+    }
+
+    results.competitions = { levels: comps, totalTeoricoPool: totalTeorico, realBalance: results.balance.usdtAvailable || 0, difference: (results.balance.usdtAvailable || 0) - totalTeorico };
+
+    if (Math.abs(results.competitions.difference) > 1) {
+      results.discrepancies.push({
+        type: 'balance_mismatch',
+        detail: `Saldo NOWPayments ($${results.balance.usdtAvailable}) difiere del pool teorico ($${totalTeorico}) por $${results.competitions.difference.toFixed(2)}`,
+        action: results.competitions.difference < 0
+          ? 'Verificar payouts enviados que redujeron saldo o comisiones de red'
+          : 'Posibles pagos no procesados o fondos extra en la cuenta'
+      });
+    }
+  } catch (err) {
+    results.competitions = { error: err.message };
+  }
+
+  // 4. Entries: pending vs confirmed + ultimas 24h
+  try {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 3600000);
+    const [allEntries, recent] = await Promise.all([
+      prisma.entry.groupBy({ by: ['status'], _count: true }),
+      prisma.entry.findMany({ where: { createdAt: { gte: twentyFourHoursAgo } }, include: { user: { select: { email: true } } }, orderBy: { createdAt: 'desc' } })
+    ]);
+
+    const statusCounts = {};
+    allEntries.forEach(g => { statusCounts[g.status] = g._count; });
+
+    const staleEntries = recent.filter(e => e.status === 'pending' && (Date.now() - new Date(e.createdAt).getTime()) > 2 * 3600000);
+
+    results.entries = {
+      statusCounts,
+      last24h: recent.map(e => ({ id: e.id, level: e.level, status: e.status, paymentId: e.paymentId, email: e.user?.email, createdAt: e.createdAt })),
+      staleCount: staleEntries.length
+    };
+
+    if (staleEntries.length > 0) {
+      results.discrepancies.push({
+        type: 'stale_pending_entries',
+        detail: `${staleEntries.length} entries llevan >2h en "pending" — posible callback perdido`,
+        action: 'Verificar estado de estos pagos en NOWPayments dashboard y confirmar manualmente si corresponde',
+        entryIds: staleEntries.map(e => e.id)
+      });
+    }
+  } catch (err) {
+    results.entries = { error: err.message };
+  }
+
+  // 5. Payouts status
+  try {
+    const [payoutGroups, recentPayouts] = await Promise.all([
+      prisma.payout.groupBy({ by: ['status'], _count: true, _sum: { amount: true } }),
+      prisma.payout.findMany({ orderBy: { date: 'desc' }, take: 10, include: { user: { select: { email: true } } } })
+    ]);
+
+    const payoutSummary = {};
+    payoutGroups.forEach(g => { payoutSummary[g.status] = { count: g._count, totalAmount: g._sum.amount || 0 }; });
+
+    results.payouts = {
+      summary: payoutSummary,
+      recent: recentPayouts.map(p => ({ id: p.id, level: p.level, position: p.position, amount: p.amount, status: p.status, paymentId: p.paymentId, email: p.user?.email, date: p.date }))
+    };
+
+    const failedCount = payoutSummary.failed?.count || 0;
+    const sentCount = payoutSummary.sent?.count || 0;
+
+    if (failedCount > 0) {
+      results.discrepancies.push({
+        type: 'failed_payouts',
+        detail: `${failedCount} payouts con status "failed"`,
+        action: 'Reintentar envio o verificar wallets de los ganadores'
+      });
+    }
+    if (sentCount > 0) {
+      results.discrepancies.push({
+        type: 'unconfirmed_payouts',
+        detail: `${sentCount} payouts "sent" sin confirmacion blockchain`,
+        action: 'Verificar webhook de payout o consultar estado en NOWPayments dashboard'
+      });
+    }
+  } catch (err) {
+    results.payouts = { error: err.message };
+  }
+
+  // 6. Pagos recientes NOWPayments (últimos 10)
+  try {
+    const npRes = await axios.get(`${NOWPAYMENTS_API}/payment/`, {
+      headers: { 'x-api-key': API_KEY },
+      params: { limit: 10, orderBy: 'created_at', sortBy: 'desc' }
+    });
+    const npPayments = npRes.data?.data || [];
+
+    // Cruzar con DB
+    if (npPayments.length > 0) {
+      const npIds = npPayments.map(p => p.payment_id?.toString()).filter(Boolean);
+      const dbEntries = await prisma.entry.findMany({
+        where: { paymentId: { in: npIds } },
+        select: { paymentId: true, status: true }
+      });
+      const dbMap = new Map(dbEntries.map(e => [e.paymentId, e.status]));
+
+      const orphaned = npPayments.filter(p => {
+        const id = p.payment_id?.toString();
+        return id && !dbMap.has(id) && (p.payment_status === 'finished' || p.payment_status === 'confirmed');
+      });
+
+      if (orphaned.length > 0) {
+        results.discrepancies.push({
+          type: 'orphaned_payments',
+          detail: `${orphaned.length} pagos confirmados en NOWPayments sin registro en DB`,
+          action: 'Verificar si son pagos validos y crear entries manualmente',
+          paymentIds: orphaned.map(p => p.payment_id)
+        });
+      }
+
+      results.nowpaymentsRecent = npPayments.map(p => ({
+        paymentId: p.payment_id,
+        status: p.payment_status,
+        priceAmount: p.price_amount,
+        actuallyPaid: p.actually_paid,
+        currency: p.pay_currency,
+        createdAt: p.created_at,
+        dbStatus: dbMap.get(p.payment_id?.toString()) || 'NOT_IN_DB'
+      }));
+    }
+  } catch (err) {
+    results.nowpaymentsRecent = { error: err.response?.data?.message || err.message };
+  }
+
+  results.healthScore = results.discrepancies.length === 0 ? 'HEALTHY' : results.discrepancies.length <= 2 ? 'WARNING' : 'CRITICAL';
+
+  res.json(results);
+});
+
 app.get('/', (req, res) => res.json({ message: 'Holypot Trading corriendo! 🚀' }));
 
 const PORT = process.env.PORT || 5000;
