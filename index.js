@@ -82,6 +82,36 @@ const io = new Server(server, {
   }
 });
 
+// ========== SOCKET.IO JWT AUTH MIDDLEWARE ==========
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+  if (!token) {
+    // Conexiones anónimas permitidas (landing, datos públicos)
+    socket.user = null;
+    return next();
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) {
+      console.warn('Socket auth fallido:', err.message);
+      socket.user = null;
+      return next(); // Permitir pero sin autenticar
+    }
+    socket.user = decoded;
+    next();
+  });
+});
+
+io.on('connection', (socket) => {
+  const userId = socket.user?.userId || 'anon';
+  console.log(`🔌 Socket conectado: ${socket.id} (user: ${userId})`);
+
+  socket.on('disconnect', () => {
+    console.log(`🔌 Socket desconectado: ${socket.id}`);
+  });
+});
+// ==================================================
+
 app.set('trust proxy', 1);
 app.use(cookieParser());
 app.use(cors({
@@ -932,6 +962,18 @@ app.post('/api/create-payment', async (req, res) => {
   const captchaValid = await verifyHCaptcha(captchaToken);
   if (!captchaValid) return res.status(400).json({ error: 'Captcha inválido — recarga la página e intenta de nuevo' });
 
+  // ========== FORZAR EMAIL VERIFICADO PARA COMPETIR ==========
+  if (email) {
+    const existingUser = await prisma.user.findUnique({ where: { email } });
+    if (existingUser && existingUser.emailVerified === false) {
+      return res.status(403).json({
+        error: 'Debes verificar tu email antes de inscribirte. Revisa tu bandeja de entrada.',
+        code: 'EMAIL_NOT_VERIFIED'
+      });
+    }
+  }
+  // =============================================================
+
   if (!levelsConfig[level]) return res.status(400).json({ error: 'Nivel inválido' });
 
   const now = new Date();
@@ -1048,6 +1090,16 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
   if (lotSize < 0.01 || lotSize > 1.0) return res.status(400).json({ error: "LotSize 0.01-1.0" });
 
   try {
+    // ========== FORZAR EMAIL VERIFICADO PARA OPERAR ==========
+    const trader = await prisma.user.findUnique({ where: { id: req.user.userId } });
+    if (trader && trader.emailVerified === false) {
+      return res.status(403).json({
+        error: 'Debes verificar tu email antes de operar. Revisa tu bandeja de entrada.',
+        code: 'EMAIL_NOT_VERIFIED'
+      });
+    }
+    // ==========================================================
+
     const entry = await prisma.entry.findUnique({
       where: { id: entryId },
       include: { positions: { where: { closedAt: null } } }
@@ -1989,10 +2041,39 @@ cron.schedule('0 21 * * *', async () => {
 
       const prizes = [0.5, 0.3, 0.2];
 
-      // 🆕 ENVIAR PAGOS AUTOMÁTICOS + GUARDAR EN DB
+      // ========== VERIFICAR SALDO ANTES DE ENVIAR PAYOUTS ==========
+      const NETWORK_FEE_USDT = 1.5; // Fee estimado TRC20 por transacción
+      const availableBalance = await getNowPaymentsBalance();
+      const totalPrizesToPay = Math.min(3, finalRanking.length);
+      const totalNeeded = prizes.slice(0, totalPrizesToPay).reduce((sum, p) => sum + (prizePool * p), 0);
+      const totalWithFees = totalNeeded + (NETWORK_FEE_USDT * totalPrizesToPay);
+
+      if (availableBalance < totalWithFees) {
+        console.error(`❌ ${level.toUpperCase()}: Saldo insuficiente! Balance: ${availableBalance} USDT, Necesario: ${totalWithFees} USDT (premios: ${totalNeeded} + fees: ${NETWORK_FEE_USDT * totalPrizesToPay})`);
+        // Guardar payouts como fallidos por saldo insuficiente
+        for (let i = 0; i < totalPrizesToPay; i++) {
+          const winner = finalRanking[i];
+          await prisma.payout.create({
+            data: {
+              userId: winner.entry.userId,
+              level: level,
+              position: i + 1,
+              amount: prizePool * prizes[i],
+              status: 'failed'
+            }
+          });
+        }
+        console.log(`⚠️ ${level.toUpperCase()}: Payouts guardados como 'failed' – requiere intervención manual`);
+        continue;
+      }
+      console.log(`✅ ${level.toUpperCase()}: Saldo OK – Balance: ${availableBalance} USDT, Necesario: ${totalWithFees} USDT`);
+      // ================================================================
+
+      // ENVIAR PAGOS AUTOMÁTICOS + GUARDAR EN DB (con network fees descontados)
       for (let i = 0; i < Math.min(3, finalRanking.length); i++) {
         const winner = finalRanking[i];
-        const prizeAmount = prizePool * prizes[i];
+        const grossPrize = prizePool * prizes[i];
+        const prizeAmount = grossPrize - NETWORK_FEE_USDT; // Descontar fee de red
         const walletAddress = winner.entry.user.walletAddress;
 
         if (!walletAddress) {
@@ -2016,7 +2097,7 @@ cron.schedule('0 21 * * *', async () => {
             }
           });
 
-          console.log(`✅ ${i+1}º ${level.toUpperCase()}: ${winner.entry.user.nickname || winner.entry.user.email} – ${prizeAmount.toFixed(2)} USDT ENVIADO a ${walletAddress}`);
+          console.log(`✅ ${i+1}º ${level.toUpperCase()}: ${winner.entry.user.nickname || winner.entry.user.email} – ${prizeAmount.toFixed(2)} USDT neto (bruto: ${grossPrize.toFixed(2)}, fee: ${NETWORK_FEE_USDT}) ENVIADO a ${walletAddress}`);
         } else {
           console.error(`❌ ${i+1}º ${level.toUpperCase()}: Error enviando pago – ${payoutResult.error}`);
           
