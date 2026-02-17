@@ -15,7 +15,11 @@ const z = require('zod');
 const cookieParser = require('cookie-parser');
 const { Resend } = require('resend');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'holypotsecret2026';
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET no configurado en .env');
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 
 // ========== EMAIL VERIFICATION SETUP ==========
 const resend = new Resend(process.env.RESEND_API_KEY);
@@ -90,10 +94,28 @@ const prisma = new PrismaClient();
 
 const NOWPAYMENTS_API = 'https://api.nowpayments.io/v1';
 const API_KEY = process.env.NOWPAYMENTS_API_KEY;
+const HCAPTCHA_SECRET = process.env.HCAPTCHA_SECRET;
 
-// ADMIN CREDENTIALS
-const ADMIN_EMAIL = 'admin@holypot.com';
-const ADMIN_PASSWORD = 'holypotadmin2026';
+async function verifyHCaptcha(token) {
+  if (!HCAPTCHA_SECRET) return true; // skip if not configured (dev)
+  try {
+    const res = await axios.post('https://api.hcaptcha.com/siteverify', new URLSearchParams({
+      secret: HCAPTCHA_SECRET,
+      response: token
+    }));
+    return res.data?.success === true;
+  } catch {
+    return false;
+  }
+}
+
+// ADMIN CREDENTIALS (desde .env)
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+  console.error('FATAL: ADMIN_EMAIL y ADMIN_PASSWORD deben estar en .env');
+  process.exit(1);
+}
 
 // ========== COOKIE CONFIG PARA CROSS-SITE (Render) ==========
 function getCookieOptions() {
@@ -731,6 +753,14 @@ app.post('/api/webhook-nowpayments', express.raw({type: 'application/json'}), as
   try {
     const data = JSON.parse(body);
     if (data.payment_status === 'finished' || data.payment_status === 'confirmed') {
+      // Verificar que el monto pagado cubra el precio esperado (tolerancia 0.5% por fluctuacion crypto)
+      const paid = parseFloat(data.actually_paid || 0);
+      const expected = parseFloat(data.price_amount || 0);
+      if (expected > 0 && paid < expected * 0.995) {
+        console.warn(`Pago parcial detectado: pagado=${paid}, esperado=${expected}, payment_id=${data.payment_id}`);
+        return res.status(200).send('OK'); // Aceptar webhook pero NO confirmar entry
+      }
+
       await prisma.entry.updateMany({
         where: { paymentId: data.payment_id.toString() },
         data: { status: "confirmed" }
@@ -743,24 +773,35 @@ app.post('/api/webhook-nowpayments', express.raw({type: 'application/json'}), as
   }
 });
 
-// 🆕 Webhook NowPayments PAYOUT (confirmación de pagos enviados)
+// Webhook NowPayments PAYOUT (confirmación de pagos enviados)
 app.post('/api/webhook-payout', express.raw({type: 'application/json'}), async (req, res) => {
   const body = req.body.toString();
-  
+  const signature = req.headers['x-nowpayments-sig'];
+  const secret = process.env.NOWPAYMENTS_SECRET;
+
+  if (secret) {
+    const hash = crypto.createHmac('sha512', secret)
+      .update(body)
+      .digest('hex');
+    if (hash !== signature) {
+      console.warn('Webhook payout HMAC invalido');
+      return res.status(401).send('Invalid signature');
+    }
+  }
+
   try {
     const data = JSON.parse(body);
-    console.log('📥 Webhook payout recibido:', data);
-    
+    console.log('Webhook payout recibido:', data);
+
     if (data.status === 'FINISHED' || data.status === 'COMPLETED') {
-      // Actualizar payout en DB como confirmado
       await prisma.payout.updateMany({
-        where: { paymentId: data.id || data.withdrawal_id },
+        where: { paymentId: (data.id || data.withdrawal_id || '').toString() },
         data: { status: 'confirmed' }
       });
-      
-      console.log('✅ Payout confirmado en blockchain');
+
+      console.log('Payout confirmado en blockchain');
     }
-    
+
     res.status(200).send('OK');
   } catch (error) {
     console.error('Error webhook payout:', error);
@@ -800,19 +841,30 @@ app.get('/api/competitions/active', async (req, res) => {
     const realBalance = await getNowPaymentsBalance();
     console.log(`💰 Balance real NowPayments: ${realBalance} USDT`);
 
-    const competitions = Object.entries(levelsConfig).map(([level, config]) => {
+    // Calcular pool teorico total para distribuir balance real proporcionalmente
+    let totalTeoricoPool = 0;
+    const levelData = Object.entries(levelsConfig).map(([level, config]) => {
       const confirmed = entries.filter(e => e.level === level);
       const participants = confirmed.length;
       const ingresos = participants * config.entryPrice;
       const revenue = participants * config.comision;
-      const prizePoolTeorico = ingresos - revenue;
+      const pool = ingresos - revenue;
+      totalTeoricoPool += pool;
+      return { level, config, participants, pool };
+    });
 
-      const now = new Date();
-      const utcNow = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds());
-      const endOfDayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59);
-      const msLeft = endOfDayUTC - utcNow;
-      const hoursLeft = Math.floor(msLeft / (1000 * 60 * 60));
-      const minutesLeft = Math.floor((msLeft % (1000 * 60 * 60)) / (1000 * 60));
+    const now = new Date();
+    const utcNow = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds());
+    const endOfDayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59);
+    const msLeft = endOfDayUTC - utcNow;
+    const hoursLeft = Math.floor(msLeft / (1000 * 60 * 60));
+    const minutesLeft = Math.floor((msLeft % (1000 * 60 * 60)) / (1000 * 60));
+
+    const competitions = levelData.map(({ level, config, participants, pool }) => {
+      // Pool real proporcional: si basic tiene 60% del pool teorico, recibe 60% del saldo real
+      const realPoolForLevel = totalTeoricoPool > 0
+        ? (pool / totalTeoricoPool) * realBalance
+        : 0;
 
       return {
         level,
@@ -820,8 +872,8 @@ app.get('/api/competitions/active', async (req, res) => {
         entryPrice: config.entryPrice,
         initialCapital: config.initialCapital,
         participants,
-        prizePool: prizePoolTeorico, // Teórico (sin descontar comisión NowPayments)
-        prizePoolReal: realBalance, // Real disponible en NowPayments
+        prizePool: pool,
+        prizePoolReal: parseFloat(realPoolForLevel.toFixed(2)),
         timeLeft: `${hoursLeft}h ${minutesLeft}m`
       };
     });
@@ -837,10 +889,13 @@ app.post('/api/create-payment', async (req, res) => {
   const {
     email, password, walletAddress,
     fullName, country, birthDate,
-    level, acceptTerms
+    level, acceptTerms, captchaToken
   } = req.body;
 
   if (!acceptTerms) return res.status(400).json({ error: 'Debes aceptar términos y condiciones' });
+
+  const captchaValid = await verifyHCaptcha(captchaToken);
+  if (!captchaValid) return res.status(400).json({ error: 'Captcha inválido — recarga la página e intenta de nuevo' });
 
   if (!levelsConfig[level]) return res.status(400).json({ error: 'Nivel inválido' });
 
@@ -908,8 +963,8 @@ app.post('/api/create-payment', async (req, res) => {
   }
 });
 
-// Confirm entry manual
-app.post('/api/confirm-entry', async (req, res) => {
+// Confirm entry manual (admin only)
+app.post('/api/confirm-entry', authenticateAdmin, async (req, res) => {
   const { entryId } = req.body;
   try {
     await prisma.entry.update({
@@ -923,8 +978,8 @@ app.post('/api/confirm-entry', async (req, res) => {
   }
 });
 
-// Manual confirm
-app.post('/api/manual-confirm', async (req, res) => {
+// Manual confirm (admin only)
+app.post('/api/manual-confirm', authenticateAdmin, async (req, res) => {
   const { email, level } = req.body;
   if (!email || !level) return res.status(400).json({ error: "Email and level required" });
   try {
