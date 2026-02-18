@@ -1739,35 +1739,40 @@ app.post('/api/manual-create-confirm', async (req, res) => {
 
     emitLiveData();
 
-    res.json({ 
-      message: "¡User + entry creados y confirmados manualmente! Capital virtual activado – ve al dashboard", 
-      entryId: entry.id 
+    res.json({
+      message: "¡User + entry creados y confirmados manualmente! Capital virtual activado – ve al dashboard",
+      entryId: entry.id
     });
   } catch (error) {
     res.status(500).json({ error: "Error manual create-confirm", details: error.message });
   }
 });
 
-// Fix passwords batch – admin only, no auth (solo para setup/dev)
-app.post('/api/admin/fix-passwords', async (req, res) => {
-  const { users } = req.body; // [{email, password}]
-  if (!users || !Array.isArray(users)) return res.status(400).json({ error: "users array required" });
+// ONE-TIME: Borrar cuentas bot de prueba – admin auth requerido
+app.post('/api/admin/cleanup-bots', authenticateAdmin, async (req, res) => {
+  const botPattern = /^test\d+@holypot\.com$/;
+  try {
+    const candidates = await prisma.user.findMany({
+      where: { email: { contains: '@holypot.com' } },
+      include: { entries: { include: { positions: true } } }
+    });
+    const bots = candidates.filter(u => botPattern.test(u.email));
 
-  const results = [];
-  for (const { email, password } of users) {
-    if (!email || !password) { results.push({ email, status: 'skipped: missing fields' }); continue; }
-    try {
-      const hashed = await bcrypt.hash(password, 10);
-      const updated = await prisma.user.update({
-        where: { email },
-        data: { password: hashed, emailVerified: true }
-      });
-      results.push({ email, status: 'ok', id: updated.id });
-    } catch (err) {
-      results.push({ email, status: `error: ${err.message}` });
+    const deleted = [];
+    for (const user of bots) {
+      for (const entry of user.entries) {
+        await prisma.position.deleteMany({ where: { entryId: entry.id } });
+        await prisma.entry.delete({ where: { id: entry.id } });
+      }
+      await prisma.user.delete({ where: { id: user.id } });
+      deleted.push(user.email);
     }
+
+    emitLiveData();
+    res.json({ message: `${deleted.length} cuentas bot eliminadas`, accounts: deleted });
+  } catch (error) {
+    res.status(500).json({ error: 'Error limpieza bots', details: error.message });
   }
-  res.json({ fixed: results.filter(r => r.status === 'ok').length, results });
 });
 
 // NUEVO ENDPOINT TOTAL PREMIOS PAGADOS HISTÓRICOS (público) – CORREGIDO
