@@ -1777,6 +1777,42 @@ app.post('/api/admin/fix-passwords', async (req, res) => {
   res.json({ fixed: results.filter(r => r.status === 'ok').length, results });
 });
 
+// Consulta usuarios confirmados – solo para admin/dev
+app.get('/api/admin/confirmed-users', async (req, res) => {
+  try {
+    const entries = await prisma.entry.findMany({
+      where: { status: 'confirmed' },
+      orderBy: { id: 'asc' },
+      include: {
+        user: {
+          select: {
+            email: true,
+            nickname: true,
+            emailVerified: true,
+            password: true,
+            walletAddress: true,
+          }
+        }
+      }
+    });
+
+    const rows = entries.map(e => ({
+      entryId: e.id,
+      level: e.level,
+      virtualCapital: e.virtualCapital,
+      email: e.user?.email,
+      nickname: e.user?.nickname,
+      walletAddress: e.user?.walletAddress,
+      emailVerified: e.user?.emailVerified,
+      hasPassword: !!e.user?.password,
+    }));
+
+    res.json({ total: rows.length, users: rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Error consultando usuarios', details: error.message });
+  }
+});
+
 // NUEVO ENDPOINT TOTAL PREMIOS PAGADOS HISTÓRICOS (público) – CORREGIDO
 app.get('/api/total-prizes-paid', async (req, res) => {
   try {
