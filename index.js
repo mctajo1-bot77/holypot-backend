@@ -1705,7 +1705,7 @@ app.get('/admin', async (req, res) => {
 
 // Manual create + confirm
 app.post('/api/manual-create-confirm', async (req, res) => {
-  const { email, walletAddress, level } = req.body;
+  const { email, walletAddress, level, password, nickname } = req.body;
   if (!email || !walletAddress || !level) return res.status(400).json({ error: "Email, wallet and level required" });
 
   const levels = {
@@ -1716,11 +1716,18 @@ app.post('/api/manual-create-confirm', async (req, res) => {
   if (!levels[level]) return res.status(400).json({ error: "Nivel inválido" });
 
   try {
+    // Siempre marcar emailVerified y setear password si se provee
+    const updateData = { walletAddress, emailVerified: true };
+    if (password) updateData.password = await bcrypt.hash(password, 10);
+    if (nickname) updateData.nickname = nickname;
+
     let user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
-      user = await prisma.user.create({ data: { email, walletAddress } });
+      user = await prisma.user.create({ data: { email, ...updateData } });
     } else {
-      await prisma.user.update({ where: { id: user.id }, data: { walletAddress } });
+      // Actualiza password solo si el user no tiene una o se pasa una nueva
+      if (!user.password && !password) updateData.password = await bcrypt.hash('holypot2024', 10);
+      await prisma.user.update({ where: { id: user.id }, data: updateData });
     }
 
     const entry = await prisma.entry.create({
