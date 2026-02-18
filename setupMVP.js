@@ -19,9 +19,9 @@ const AMIGOS = [
     nickname: 'TuAmor',
   },
   {
-    email: 'amigo3@gmail.com',         // <-- cambia esto
-    walletAddress: 'TWALLET_AMIGO_3',
-    nickname: 'Amigo3',
+    email: 'orbepublicidad@hotmail.com',         // <-- cambia esto
+    walletAddress: 'TDaZh6SK41TY7MwDLTEjScEyWZnBTfmmDr',
+    nickname: 'damapema',
   },
 ];
 
