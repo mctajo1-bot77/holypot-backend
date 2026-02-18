@@ -15,9 +15,9 @@ for (let i = 100; i <= 109; i++) {
 // password que usaran para entrar
 // ─────────────────────────────────────────────────────────────
 const amigos = [
-  { email: 'amigo1@gmail.com', password: 'holypot2024' }, // <-- cambia email
-  { email: 'amigo2@gmail.com', password: 'holypot2024' }, // <-- cambia email
-  { email: 'amigo3@gmail.com', password: 'holypot2024' }, // <-- cambia email
+  { email: 'rodrivit99@gmail.com', password: 'holypot2024' }, // <-- cambia email
+  { email: 'linaperez2701@gmail.com', password: 'holypot2024' }, // <-- cambia email
+  { email: 'orbepublicidad@hotmail.com', password: 'holypot2024' }, // <-- cambia email
 ];
 
 (async () => {
