@@ -1705,7 +1705,7 @@ app.get('/admin', async (req, res) => {
 
 // Manual create + confirm
 app.post('/api/manual-create-confirm', async (req, res) => {
-  const { email, walletAddress, level, password, nickname } = req.body;
+  const { email, walletAddress, level } = req.body;
   if (!email || !walletAddress || !level) return res.status(400).json({ error: "Email, wallet and level required" });
 
   const levels = {
@@ -1716,18 +1716,11 @@ app.post('/api/manual-create-confirm', async (req, res) => {
   if (!levels[level]) return res.status(400).json({ error: "Nivel inválido" });
 
   try {
-    // Siempre marcar emailVerified y setear password si se provee
-    const updateData = { walletAddress, emailVerified: true };
-    if (password) updateData.password = await bcrypt.hash(password, 10);
-    if (nickname) updateData.nickname = nickname;
-
     let user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
-      user = await prisma.user.create({ data: { email, ...updateData } });
+      user = await prisma.user.create({ data: { email, walletAddress } });
     } else {
-      // Actualiza password solo si el user no tiene una o se pasa una nueva
-      if (!user.password && !password) updateData.password = await bcrypt.hash('holypot2024', 10);
-      await prisma.user.update({ where: { id: user.id }, data: updateData });
+      await prisma.user.update({ where: { id: user.id }, data: { walletAddress } });
     }
 
     const entry = await prisma.entry.create({
@@ -1746,70 +1739,39 @@ app.post('/api/manual-create-confirm', async (req, res) => {
 
     emitLiveData();
 
-    res.json({ 
-      message: "¡User + entry creados y confirmados manualmente! Capital virtual activado – ve al dashboard", 
-      entryId: entry.id 
+    res.json({
+      message: "¡User + entry creados y confirmados manualmente! Capital virtual activado – ve al dashboard",
+      entryId: entry.id
     });
   } catch (error) {
     res.status(500).json({ error: "Error manual create-confirm", details: error.message });
   }
 });
 
-// Fix passwords batch – admin only, no auth (solo para setup/dev)
-app.post('/api/admin/fix-passwords', async (req, res) => {
-  const { users } = req.body; // [{email, password}]
-  if (!users || !Array.isArray(users)) return res.status(400).json({ error: "users array required" });
-
-  const results = [];
-  for (const { email, password } of users) {
-    if (!email || !password) { results.push({ email, status: 'skipped: missing fields' }); continue; }
-    try {
-      const hashed = await bcrypt.hash(password, 10);
-      const updated = await prisma.user.update({
-        where: { email },
-        data: { password: hashed, emailVerified: true }
-      });
-      results.push({ email, status: 'ok', id: updated.id });
-    } catch (err) {
-      results.push({ email, status: `error: ${err.message}` });
-    }
-  }
-  res.json({ fixed: results.filter(r => r.status === 'ok').length, results });
-});
-
-// Consulta usuarios confirmados – solo para admin/dev
-app.get('/api/admin/confirmed-users', async (req, res) => {
+// ONE-TIME: Borrar cuentas bot de prueba – admin auth requerido
+app.post('/api/admin/cleanup-bots', authenticateAdmin, async (req, res) => {
+  const botPattern = /^test\d+@holypot\.com$/;
   try {
-    const entries = await prisma.entry.findMany({
-      where: { status: 'confirmed' },
-      orderBy: { id: 'asc' },
-      include: {
-        user: {
-          select: {
-            email: true,
-            nickname: true,
-            emailVerified: true,
-            password: true,
-            walletAddress: true,
-          }
-        }
-      }
+    const candidates = await prisma.user.findMany({
+      where: { email: { contains: '@holypot.com' } },
+      include: { entries: { include: { positions: true } } }
     });
+    const bots = candidates.filter(u => botPattern.test(u.email));
 
-    const rows = entries.map(e => ({
-      entryId: e.id,
-      level: e.level,
-      virtualCapital: e.virtualCapital,
-      email: e.user?.email,
-      nickname: e.user?.nickname,
-      walletAddress: e.user?.walletAddress,
-      emailVerified: e.user?.emailVerified,
-      hasPassword: !!e.user?.password,
-    }));
+    const deleted = [];
+    for (const user of bots) {
+      for (const entry of user.entries) {
+        await prisma.position.deleteMany({ where: { entryId: entry.id } });
+        await prisma.entry.delete({ where: { id: entry.id } });
+      }
+      await prisma.user.delete({ where: { id: user.id } });
+      deleted.push(user.email);
+    }
 
-    res.json({ total: rows.length, users: rows });
+    emitLiveData();
+    res.json({ message: `${deleted.length} cuentas bot eliminadas`, accounts: deleted });
   } catch (error) {
-    res.status(500).json({ error: 'Error consultando usuarios', details: error.message });
+    res.status(500).json({ error: 'Error limpieza bots', details: error.message });
   }
 });
 
