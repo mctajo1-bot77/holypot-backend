@@ -38,7 +38,7 @@ async function crearAmigo({ email, walletAddress, nickname }) {
   try {
     await axios.post(`${API_BASE}/register`, {
       email,
-      password: 'holypot2024',
+      password: 'holypot2024.24',
       walletAddress,
       nickname,
     });
@@ -60,7 +60,7 @@ async function crearAmigo({ email, walletAddress, nickname }) {
       level: LEVEL,
     });
     console.log(`  ✓ Entry confirmada – puede operar sin pagar`);
-    console.log(`  → Login: ${email} / holypot2024`);
+    console.log(`  → Login: ${email} / holypot2024.24`);
   } catch (err) {
     console.error(`  ✗ Error confirming entry: ${err.response?.data?.error || err.message}`);
   }
@@ -74,7 +74,7 @@ async function crearFake(index) {
   try {
     await axios.post(`${API_BASE}/register`, {
       email,
-      password: 'test123',
+      password: 'test123.456',
       walletAddress: FAKE_WALLET,
       nickname,
     });
