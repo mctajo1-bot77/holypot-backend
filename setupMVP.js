@@ -9,14 +9,14 @@ const LEVEL = 'basic';
 // ─────────────────────────────────────────────
 const AMIGOS = [
   {
-    email: 'amigo1@gmail.com',         // <-- cambia esto
-    walletAddress: 'TWALLET_AMIGO_1',  // <-- wallet TRC-20 del amigo
-    nickname: 'Amigo1',                // <-- nombre que vera en el ranking
+    email: 'rodrivit99@gmail.com',         // <-- cambia esto
+    walletAddress: 'TMQSG6kih8ZWjtthSLFxc3abTASxwPftju',  // <-- wallet TRC-20 del amigo
+    nickname: 'nioz',                // <-- nombre que vera en el ranking
   },
   {
-    email: 'amigo2@gmail.com',         // <-- cambia esto
-    walletAddress: 'TWALLET_AMIGO_2',
-    nickname: 'Amigo2',
+    email: 'linaperez2701@gmail.com',         // <-- cambia esto
+    walletAddress: 'TDaZh6SK41Tk7MwDLTEjScEyWZnBTfmmDr',
+    nickname: 'TuAmor',
   },
   {
     email: 'amigo3@gmail.com',         // <-- cambia esto
