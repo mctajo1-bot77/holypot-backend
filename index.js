@@ -165,44 +165,44 @@ const levelsConfig = {
   premium: { name: "Premium", entryPrice: 107, comision: 7, initialCapital: 100000 }
 };
 
-// 🆕 FUNCIÓN: Obtener balance real de NowPayments
-async function getNowPaymentsBalance() {
+// Configuración de redes de pago
+const NETWORK_CONFIG = {
+  polygon:  { nowpaymentsCurrency: 'usdtpoly',  fee: 0.50,  label: 'Polygon'   },
+  trc20:    { nowpaymentsCurrency: 'usdttrc20', fee: 4.50,  label: 'TRC-20'    },
+  ethereum: { nowpaymentsCurrency: 'usdt',       fee: 17.50, label: 'Ethereum'  }
+};
+
+// 🆕 FUNCIÓN: Obtener balance real de NowPayments (por moneda)
+async function getNowPaymentsBalance(currency = 'usdttrc20') {
   try {
     const response = await axios.get(`${NOWPAYMENTS_API}/balance`, {
       headers: { 'x-api-key': API_KEY }
     });
-    
-    // NowPayments devuelve balance por moneda
-    // Buscamos USDT TRC20
     const currencies = response.data.currencies || [];
-    const usdtBalance = currencies.find(c => c.currency === 'usdttrc20');
-    
-    return usdtBalance ? parseFloat(usdtBalance.available_balance || 0) : 0;
+    const found = currencies.find(c => c.currency === currency);
+    return found ? parseFloat(found.available_balance || 0) : 0;
   } catch (error) {
     console.error('❌ Error obteniendo balance NowPayments:', error.response?.data || error.message);
     return 0;
   }
 }
 
-// 🆕 FUNCIÓN: Enviar pago automático vía NowPayments
-async function sendNowPaymentsPayout(walletAddress, amount, level, position) {
+// 🆕 FUNCIÓN: Enviar pago individual vía NowPayments (legacy / fallback)
+async function sendNowPaymentsPayout(walletAddress, amount, level, position, network = 'trc20') {
   try {
+    const netCfg = NETWORK_CONFIG[network] || NETWORK_CONFIG.trc20;
     const response = await axios.post(`${NOWPAYMENTS_API}/payout`, {
       withdrawals: [{
         address: walletAddress,
-        currency: 'usdttrc20',
+        currency: netCfg.nowpaymentsCurrency,
         amount: amount.toFixed(2),
         ipn_callback_url: `${process.env.BACKEND_URL || 'https://holypot-backend.onrender.com'}/api/webhook-payout`
       }]
     }, {
-      headers: {
-        'x-api-key': API_KEY,
-        'Content-Type': 'application/json'
-      }
+      headers: { 'x-api-key': API_KEY, 'Content-Type': 'application/json' }
     });
 
-    console.log(`✅ Pago enviado a ${walletAddress}: ${amount} USDT - Response:`, response.data);
-    
+    console.log(`✅ Pago enviado a ${walletAddress}: ${amount} USDT (${network}) - Response:`, response.data);
     return {
       success: true,
       paymentId: response.data.id || response.data.withdrawals?.[0]?.id,
@@ -210,11 +210,91 @@ async function sendNowPaymentsPayout(walletAddress, amount, level, position) {
     };
   } catch (error) {
     console.error('❌ Error enviando payout NowPayments:', error.response?.data || error.message);
-    return {
-      success: false,
-      error: error.response?.data || error.message
-    };
+    return { success: false, error: error.response?.data || error.message };
   }
+}
+
+// 🆕 FUNCIÓN: Batch settlement – agrupa payouts pendientes por red y envía en un solo request
+async function processBatchPayouts(targetNetwork = null) {
+  console.log(`🏦 Iniciando batch payout${targetNetwork ? ` para red: ${targetNetwork}` : ' (todas las redes)'}`);
+
+  const whereClause = { status: 'pending', walletAddress: { not: null } };
+  if (targetNetwork) whereClause.network = targetNetwork;
+
+  const pendingPayouts = await prisma.payout.findMany({
+    where: whereClause,
+    include: { user: true }
+  });
+
+  if (pendingPayouts.length === 0) {
+    console.log('✅ No hay payouts pendientes para procesar');
+    return { processed: 0 };
+  }
+
+  // Agrupar por red
+  const byNetwork = {};
+  for (const p of pendingPayouts) {
+    const net = p.network || 'trc20';
+    if (!byNetwork[net]) byNetwork[net] = [];
+    byNetwork[net].push(p);
+  }
+
+  let totalProcessed = 0;
+
+  for (const [network, payouts] of Object.entries(byNetwork)) {
+    const netCfg = NETWORK_CONFIG[network];
+    if (!netCfg) { console.warn(`Red desconocida: ${network}`); continue; }
+
+    const totalAmount = payouts.reduce((sum, p) => sum + p.amount, 0);
+    console.log(`📦 Batch ${network}: ${payouts.length} payouts → ${totalAmount.toFixed(2)} USDT`);
+
+    // Verificar saldo
+    const balance = await getNowPaymentsBalance(netCfg.nowpaymentsCurrency);
+    if (balance < totalAmount) {
+      console.error(`❌ Saldo insuficiente en ${network}: ${balance} < ${totalAmount}`);
+      continue;
+    }
+
+    // Crear registro batch
+    const batch = await prisma.payoutBatch.create({
+      data: { network, status: 'pending', totalAmount, payoutCount: payouts.length }
+    });
+
+    try {
+      const withdrawals = payouts.map(p => ({
+        address: p.walletAddress,
+        currency: netCfg.nowpaymentsCurrency,
+        amount: p.amount.toFixed(2),
+        ipn_callback_url: `${process.env.BACKEND_URL || 'https://holypot-backend.onrender.com'}/api/webhook-payout`
+      }));
+
+      const response = await axios.post(`${NOWPAYMENTS_API}/payout`, { withdrawals }, {
+        headers: { 'x-api-key': API_KEY, 'Content-Type': 'application/json' }
+      });
+
+      const nowpaymentsId = (response.data.id || response.data.withdrawals?.[0]?.batch_id || '').toString();
+
+      await prisma.payoutBatch.update({
+        where: { id: batch.id },
+        data: { status: 'sent', nowpaymentsId, sentAt: new Date() }
+      });
+
+      for (const payout of payouts) {
+        await prisma.payout.update({
+          where: { id: payout.id },
+          data: { status: 'sent', batchId: batch.id, paymentId: nowpaymentsId }
+        });
+      }
+
+      console.log(`✅ Batch ${network} enviado: ${payouts.length} payouts, ${totalAmount.toFixed(2)} USDT (batchId: ${batch.id})`);
+      totalProcessed += payouts.length;
+    } catch (error) {
+      console.error(`❌ Batch ${network} falló:`, error.response?.data || error.message);
+      await prisma.payoutBatch.update({ where: { id: batch.id }, data: { status: 'failed' } });
+    }
+  }
+
+  return { processed: totalProcessed };
 }
 
 // Finnhub WebSocket real-time prices
@@ -859,12 +939,21 @@ app.post('/api/webhook-payout', express.raw({type: 'application/json'}), async (
     console.log('Webhook payout recibido:', data);
 
     if (data.status === 'FINISHED' || data.status === 'COMPLETED') {
+      const nowpayId = (data.id || data.withdrawal_id || data.batch_withdrawal_id || '').toString();
+
+      // Confirmar payouts individuales por paymentId
       await prisma.payout.updateMany({
-        where: { paymentId: (data.id || data.withdrawal_id || '').toString() },
+        where: { paymentId: nowpayId },
         data: { status: 'confirmed' }
       });
 
-      console.log('Payout confirmado en blockchain');
+      // Confirmar batch si existe
+      await prisma.payoutBatch.updateMany({
+        where: { nowpaymentsId: nowpayId },
+        data: { status: 'confirmed', confirmedAt: new Date() }
+      });
+
+      console.log(`✅ Payout/Batch confirmado en blockchain: ${nowpayId}`);
     }
 
     res.status(200).send('OK');
@@ -891,6 +980,56 @@ app.get('/api/admin/payouts', authenticateAdmin, async (req, res) => {
   } catch (err) {
     console.error('Error admin payouts:', err);
     res.status(500).json({ error: 'Error cargando payouts' });
+  }
+});
+
+// ADMIN – Payouts pendientes agrupados por red
+app.get('/api/admin/pending-payouts', authenticateAdmin, async (req, res) => {
+  try {
+    const pending = await prisma.payout.findMany({
+      where: { status: 'pending' },
+      include: { user: { select: { email: true, nickname: true } } },
+      orderBy: { date: 'desc' }
+    });
+
+    // Agrupar por red
+    const byNetwork = {};
+    for (const p of pending) {
+      const net = p.network || 'trc20';
+      if (!byNetwork[net]) byNetwork[net] = { network: net, label: NETWORK_CONFIG[net]?.label || net, payouts: [], totalAmount: 0 };
+      byNetwork[net].payouts.push(p);
+      byNetwork[net].totalAmount += p.amount;
+    }
+
+    res.json(Object.values(byNetwork));
+  } catch (err) {
+    res.status(500).json({ error: 'Error cargando payouts pendientes' });
+  }
+});
+
+// ADMIN – Historial de batches
+app.get('/api/admin/batch-payouts', authenticateAdmin, async (req, res) => {
+  try {
+    const batches = await prisma.payoutBatch.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      include: { payouts: { include: { user: { select: { nickname: true } } } } }
+    });
+    res.json(batches);
+  } catch (err) {
+    res.status(500).json({ error: 'Error cargando batches' });
+  }
+});
+
+// ADMIN – Trigger batch payout manual
+app.post('/api/admin/trigger-batch-payout', authenticateAdmin, async (req, res) => {
+  const { network } = req.body; // opcional: filtrar por red
+  try {
+    const result = await processBatchPayouts(network || null);
+    res.json({ message: `Batch payout ejecutado: ${result.processed} payouts procesados`, ...result });
+  } catch (err) {
+    console.error('Error trigger batch payout:', err);
+    res.status(500).json({ error: 'Error ejecutando batch payout', details: err.message });
   }
 });
 
@@ -954,7 +1093,8 @@ app.post('/api/create-payment', async (req, res) => {
   const {
     email, password, walletAddress,
     fullName, country, birthDate,
-    level, acceptTerms, captchaToken
+    level, acceptTerms, captchaToken,
+    paymentNetwork = 'polygon'
   } = req.body;
 
   if (!acceptTerms) return res.status(400).json({ error: 'Debes aceptar términos y condiciones' });
@@ -984,6 +1124,10 @@ app.post('/api/create-payment', async (req, res) => {
 
   const { entryPrice: total, initialCapital: capital } = levelsConfig[level];
 
+  const validNetworks = Object.keys(NETWORK_CONFIG);
+  const selectedNetwork = validNetworks.includes(paymentNetwork) ? paymentNetwork : 'polygon';
+  const netCfg = NETWORK_CONFIG[selectedNetwork];
+
   try {
     let user = await prisma.user.findUnique({ where: { email } });
     if (user && user.password) {
@@ -991,15 +1135,8 @@ app.post('/api/create-payment', async (req, res) => {
       const hashedPassword = password ? await bcrypt.hash(password, 10) : undefined;
       user = await prisma.user.upsert({
         where: { email },
-        update: {
-          walletAddress,
-          password: hashedPassword
-        },
-        create: {
-          email,
-          walletAddress,
-          password: hashedPassword
-        }
+        update: { walletAddress, password: hashedPassword },
+        create: { email, walletAddress, password: hashedPassword }
       });
     }
 
@@ -1008,7 +1145,7 @@ app.post('/api/create-payment', async (req, res) => {
     const response = await axios.post(`${NOWPAYMENTS_API}/invoice`, {
       price_amount: total,
       price_currency: "usd",
-      pay_currency: "usdttrc20",
+      pay_currency: netCfg.nowpaymentsCurrency,
       ipn_callback_url: `${process.env.BACKEND_URL || 'https://holypot-backend.onrender.com'}/api/webhook-nowpayments`,
       order_description: `Inscripción Holypot ${level.toUpperCase()} - ${email}`,
       success_url: `${process.env.FRONTEND_URL || 'https://holypot-landing.onrender.com'}/dashboard`,
@@ -1024,6 +1161,7 @@ app.post('/api/create-payment', async (req, res) => {
         user: { connect: { id: user.id } },
         level,
         paymentId: paymentData.id,
+        paymentNetwork: selectedNetwork,
         status: "pending",
         virtualCapital: capital
       }
@@ -2068,80 +2206,39 @@ cron.schedule('0 21 * * *', async () => {
 
       const prizes = [0.5, 0.3, 0.2];
 
-      // ========== VERIFICAR SALDO ANTES DE ENVIAR PAYOUTS ==========
-      const NETWORK_FEE_USDT = 1.5; // Fee estimado TRC20 por transacción
-      const availableBalance = await getNowPaymentsBalance();
+      // ========== GUARDAR PAYOUTS PENDIENTES (el batch los enviará a las 02:00 AM) ==========
       const totalPrizesToPay = Math.min(3, finalRanking.length);
-      const totalNeeded = prizes.slice(0, totalPrizesToPay).reduce((sum, p) => sum + (prizePool * p), 0);
-      const totalWithFees = totalNeeded + (NETWORK_FEE_USDT * totalPrizesToPay);
+      console.log(`💾 ${level.toUpperCase()}: Guardando ${totalPrizesToPay} payouts pendientes para batch settlement`);
 
-      if (availableBalance < totalWithFees) {
-        console.error(`❌ ${level.toUpperCase()}: Saldo insuficiente! Balance: ${availableBalance} USDT, Necesario: ${totalWithFees} USDT (premios: ${totalNeeded} + fees: ${NETWORK_FEE_USDT * totalPrizesToPay})`);
-        // Guardar payouts como fallidos por saldo insuficiente
-        for (let i = 0; i < totalPrizesToPay; i++) {
-          const winner = finalRanking[i];
-          await prisma.payout.create({
-            data: {
-              userId: winner.entry.userId,
-              level: level,
-              position: i + 1,
-              amount: prizePool * prizes[i],
-              status: 'failed'
-            }
-          });
-        }
-        console.log(`⚠️ ${level.toUpperCase()}: Payouts guardados como 'failed' – requiere intervención manual`);
-        continue;
-      }
-      console.log(`✅ ${level.toUpperCase()}: Saldo OK – Balance: ${availableBalance} USDT, Necesario: ${totalWithFees} USDT`);
-      // ================================================================
-
-      // ENVIAR PAGOS AUTOMÁTICOS + GUARDAR EN DB (con network fees descontados)
-      for (let i = 0; i < Math.min(3, finalRanking.length); i++) {
+      for (let i = 0; i < totalPrizesToPay; i++) {
         const winner = finalRanking[i];
         const grossPrize = prizePool * prizes[i];
-        const prizeAmount = grossPrize - NETWORK_FEE_USDT; // Descontar fee de red
+        const winnerNetwork = winner.entry.paymentNetwork || 'trc20';
+        const netFee = NETWORK_CONFIG[winnerNetwork]?.fee || 1.5;
+        const prizeAmount = Math.max(0, grossPrize - netFee);
         const walletAddress = winner.entry.user.walletAddress;
 
         if (!walletAddress) {
-          console.log(`⚠️ ${i+1}º ${level.toUpperCase()}: Usuario sin wallet – premio NO enviado`);
+          console.log(`⚠️ ${i+1}º ${level.toUpperCase()}: Usuario sin wallet – omitido`);
           continue;
         }
 
-        // 🆕 ENVIAR PAGO VÍA NOWPAYMENTS
-        const payoutResult = await sendNowPaymentsPayout(walletAddress, prizeAmount, level, i + 1);
+        await prisma.payout.create({
+          data: {
+            userId: winner.entry.userId,
+            level,
+            position: i + 1,
+            amount: prizeAmount,
+            status: 'pending',
+            network: winnerNetwork,
+            walletAddress
+          }
+        });
 
-        if (payoutResult.success) {
-          // Guardar en DB con paymentId
-          await prisma.payout.create({
-            data: {
-              userId: winner.entry.userId,
-              level: level,
-              position: i + 1,
-              amount: prizeAmount,
-              status: 'sent', // pending → sent → confirmed (webhook)
-              paymentId: payoutResult.paymentId || null
-            }
-          });
-
-          console.log(`✅ ${i+1}º ${level.toUpperCase()}: ${winner.entry.user.nickname || winner.entry.user.email} – ${prizeAmount.toFixed(2)} USDT neto (bruto: ${grossPrize.toFixed(2)}, fee: ${NETWORK_FEE_USDT}) ENVIADO a ${walletAddress}`);
-        } else {
-          console.error(`❌ ${i+1}º ${level.toUpperCase()}: Error enviando pago – ${payoutResult.error}`);
-          
-          // Guardar en DB como fallido
-          await prisma.payout.create({
-            data: {
-              userId: winner.entry.userId,
-              level: level,
-              position: i + 1,
-              amount: prizeAmount,
-              status: 'failed'
-            }
-          });
-        }
+        console.log(`💾 ${i+1}º ${level.toUpperCase()}: ${winner.entry.user.nickname || winner.entry.user.email} – ${prizeAmount.toFixed(2)} USDT neto (${winnerNetwork}) – pendiente batch`);
       }
 
-      console.log(`✅ Competencia ${level.toUpperCase()} cerrada + pagos procesados`);
+      console.log(`✅ Competencia ${level.toUpperCase()} cerrada + ${totalPrizesToPay} payouts en cola para batch`);
     }
 
     // LIMPIEZA AUTOMÁTICA VELAS DE AYER
@@ -2228,5 +2325,17 @@ Máximo 250 caracteres, tono entusiasta y profesional.
     emitLiveData();
   } catch (error) {
     console.error('Error en cron diario:', error);
+  }
+});
+
+// 🆕 CRON BATCH SETTLEMENT 02:00 AM UTC – Envía todos los payouts pendientes agrupados por red
+cron.schedule('0 2 * * *', async () => {
+  console.log('🏦 CRON 02:00 UTC – Batch Settlement: enviando payouts pendientes...');
+  try {
+    const result = await processBatchPayouts();
+    console.log(`✅ Batch Settlement completado: ${result.processed} payouts procesados`);
+    emitLiveData();
+  } catch (error) {
+    console.error('❌ Error en cron batch settlement:', error);
   }
 });
