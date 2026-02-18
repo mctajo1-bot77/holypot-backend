@@ -1748,6 +1748,28 @@ app.post('/api/manual-create-confirm', async (req, res) => {
   }
 });
 
+// Fix passwords batch – admin only, no auth (solo para setup/dev)
+app.post('/api/admin/fix-passwords', async (req, res) => {
+  const { users } = req.body; // [{email, password}]
+  if (!users || !Array.isArray(users)) return res.status(400).json({ error: "users array required" });
+
+  const results = [];
+  for (const { email, password } of users) {
+    if (!email || !password) { results.push({ email, status: 'skipped: missing fields' }); continue; }
+    try {
+      const hashed = await bcrypt.hash(password, 10);
+      const updated = await prisma.user.update({
+        where: { email },
+        data: { password: hashed, emailVerified: true }
+      });
+      results.push({ email, status: 'ok', id: updated.id });
+    } catch (err) {
+      results.push({ email, status: `error: ${err.message}` });
+    }
+  }
+  res.json({ fixed: results.filter(r => r.status === 'ok').length, results });
+});
+
 // NUEVO ENDPOINT TOTAL PREMIOS PAGADOS HISTÓRICOS (público) – CORREGIDO
 app.get('/api/total-prizes-paid', async (req, res) => {
   try {
