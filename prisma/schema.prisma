@@ -39,6 +39,7 @@ model Entry {
   competitionId  String?
   level          String
   paymentId      String? // ID del pago en NOWPayments
+  paymentNetwork String?  @default("polygon") // polygon, trc20, ethereum
   status         String   @default("pending") // pending, confirmed, disqualified, winner
   virtualCapital Float // capital inicial + P&L acumulado
   createdAt      DateTime @default(now())
@@ -75,16 +76,34 @@ model Position {
 }
 
 model Payout {
-  id        Int      @id @default(autoincrement())
-  userId    String
-  level     String
-  position  Int
-  amount    Float
-  date      DateTime @default(now())
-  status    String   @default("pending")  // pending, sent, confirmed, failed
-  paymentId String?                        // NowPayments payout ID
-  
-  user      User     @relation(fields: [userId], references: [id])
+  id            Int          @id @default(autoincrement())
+  userId        String
+  level         String
+  position      Int
+  amount        Float
+  date          DateTime     @default(now())
+  status        String       @default("pending") // pending, sent, confirmed, failed
+  paymentId     String?                           // NowPayments payout ID
+  network       String?      @default("trc20")    // polygon, trc20, ethereum
+  walletAddress String?                            // cached wallet for batch
+  batchId       Int?
+
+  user          User         @relation(fields: [userId], references: [id])
+  batch         PayoutBatch? @relation(fields: [batchId], references: [id])
+}
+
+model PayoutBatch {
+  id            Int       @id @default(autoincrement())
+  network       String                              // polygon, trc20, ethereum
+  status        String    @default("pending")       // pending, sent, confirmed, failed
+  totalAmount   Float
+  payoutCount   Int       @default(0)
+  nowpaymentsId String?                             // batch payout ID from NOWPayments
+  sentAt        DateTime?
+  confirmedAt   DateTime?
+  createdAt     DateTime  @default(now())
+
+  payouts       Payout[]
 }
 model DailyCandle {
   id        Int      @id @default(autoincrement())
