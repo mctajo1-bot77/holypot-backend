@@ -1174,6 +1174,7 @@ app.post('/api/create-payment', async (req, res) => {
       entryId: entry.id
     });
   } catch (error) {
+    console.error('❌ Error creando pago:', error.response?.data || error.message);
     res.status(500).json({ error: 'Error creando pago', details: error.response?.data || error.message });
   }
 });
