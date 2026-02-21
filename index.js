@@ -1093,13 +1093,13 @@ app.post('/api/create-payment', async (req, res) => {
   const {
     email, password, walletAddress,
     fullName, country, birthDate,
-    level, acceptTerms, captchaToken,
+    level, acceptTerms, hCaptchaToken,
     paymentNetwork = 'polygon'
   } = req.body;
 
   if (!acceptTerms) return res.status(400).json({ error: 'Debes aceptar términos y condiciones' });
 
-  const captchaValid = await verifyHCaptcha(captchaToken);
+  const captchaValid = await verifyHCaptcha(hCaptchaToken);
   if (!captchaValid) return res.status(400).json({ error: 'Captcha inválido — recarga la página e intenta de nuevo' });
 
   // ========== FORZAR EMAIL VERIFICADO PARA COMPETIR ==========
