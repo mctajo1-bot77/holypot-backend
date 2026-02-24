@@ -1913,9 +1913,9 @@ app.post('/api/manual-create-confirm', async (req, res) => {
   try {
     let user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
-      user = await prisma.user.create({ data: { email, walletAddress } });
+      user = await prisma.user.create({ data: { email, walletAddress, emailVerified: true } });
     } else {
-      await prisma.user.update({ where: { id: user.id }, data: { walletAddress } });
+      user = await prisma.user.update({ where: { id: user.id }, data: { walletAddress, emailVerified: true } });
     }
 
     const entry = await prisma.entry.create({
