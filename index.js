@@ -172,6 +172,21 @@ const NETWORK_CONFIG = {
   ethereum: { nowpaymentsCurrency: 'usdt',       fee: 17.50, label: 'Ethereum'  }
 };
 
+// Verificar si una moneda está disponible para recibir pagos en NowPayments
+async function checkNowPaymentsCurrencyAvailable(currency) {
+  try {
+    const response = await axios.get(`${NOWPAYMENTS_API}/currencies`, {
+      headers: { 'x-api-key': API_KEY },
+      params: { isFiat: false }
+    });
+    const available = response.data.currencies || [];
+    return available.some(c => c.toLowerCase() === currency.toLowerCase());
+  } catch (error) {
+    console.error('❌ Error verificando moneda NowPayments:', error.response?.data || error.message);
+    return true; // Permitir en caso de error para no bloquear pagos
+  }
+}
+
 // 🆕 FUNCIÓN: Obtener balance real de NowPayments (por moneda)
 async function getNowPaymentsBalance(currency = 'usdttrc20') {
   try {
@@ -581,10 +596,11 @@ async function emitLiveData() {
           const sign = p.direction === 'long' ? 1 : -1;
           const pnlPercent = sign * ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
           const pnlAmount = entry.virtualCapital * (p.lotSize || 0) * (pnlPercent / 100);
+          const newCapital = entry.virtualCapital + pnlAmount;
 
           await prisma.entry.update({
             where: { id: entry.id },
-            data: { virtualCapital: entry.virtualCapital + pnlAmount }
+            data: { virtualCapital: newCapital }
           });
 
           await prisma.position.update({
@@ -599,6 +615,36 @@ async function emitLiveData() {
             pnlPercent: pnlPercent.toFixed(4),
             pnlAmount: pnlAmount.toFixed(2)
           });
+
+          // AUTO-DESCALIFICACIÓN: drawdown > 10% del capital inicial
+          if (entry.status === 'confirmed') {
+            const levelCfg = levelsConfig[entry.level];
+            if (levelCfg && newCapital < levelCfg.initialCapital * 0.90) {
+              // Cerrar todas las posiciones abiertas restantes
+              const remaining = openPositions.filter(op => op.id !== p.id && !op.closedAt);
+              for (const op of remaining) {
+                const opPrice = getCurrentPrice(op.symbol);
+                const opPnl = opPrice && op.entryPrice
+                  ? (op.direction === 'long' ? 1 : -1) * ((opPrice - op.entryPrice) / op.entryPrice) * 100
+                  : 0;
+                await prisma.position.update({
+                  where: { id: op.id },
+                  data: { closedAt: new Date(), currentPnl: opPnl, closeReason: 'drawdown_disqualified' }
+                });
+              }
+              await prisma.entry.update({
+                where: { id: entry.id },
+                data: { status: 'disqualified' }
+              });
+              const drawdownPct = (((levelCfg.initialCapital - newCapital) / levelCfg.initialCapital) * 100).toFixed(2);
+              console.log(`⛔ Entry ${entry.id} descalificada — drawdown ${drawdownPct}%`);
+              io.emit('entryDisqualified', {
+                entryId: entry.id,
+                reason: 'drawdown_exceeded',
+                drawdownPercent: drawdownPct
+              });
+            }
+          }
         }
       }));
 
@@ -1127,6 +1173,16 @@ app.post('/api/create-payment', async (req, res) => {
   const validNetworks = Object.keys(NETWORK_CONFIG);
   const selectedNetwork = validNetworks.includes(paymentNetwork) ? paymentNetwork : 'polygon';
   const netCfg = NETWORK_CONFIG[selectedNetwork];
+
+  // Verificar que la moneda esté disponible en NowPayments antes de crear el invoice
+  const currencyAvailable = await checkNowPaymentsCurrencyAvailable(netCfg.nowpaymentsCurrency);
+  if (!currencyAvailable) {
+    console.error(`❌ Moneda no disponible en NowPayments: ${netCfg.nowpaymentsCurrency}`);
+    return res.status(503).json({
+      error: `La red ${netCfg.label} no está disponible en este momento. Por favor selecciona otra red de pago.`,
+      code: 'CURRENCY_UNAVAILABLE'
+    });
+  }
 
   try {
     let user = await prisma.user.findUnique({ where: { email } });
@@ -1888,6 +1944,38 @@ app.post('/api/manual-create-confirm', async (req, res) => {
 });
 
 // ONE-TIME: Borrar cuentas bot de prueba – admin auth requerido
+// ENDPOINT: entradas descalificadas por drawdown
+app.get('/api/admin/disqualified-entries', authenticateAdmin, async (req, res) => {
+  try {
+    const entries = await prisma.entry.findMany({
+      where: { status: 'disqualified' },
+      include: { user: true, positions: true },
+      orderBy: { createdAt: 'desc' }
+    });
+    const result = entries.map(e => {
+      const levelCfg = levelsConfig[e.level] || { initialCapital: 10000 };
+      const drawdownPct = (((levelCfg.initialCapital - e.virtualCapital) / levelCfg.initialCapital) * 100).toFixed(2);
+      return {
+        entryId: e.id,
+        email: e.user.email,
+        nickname: e.user.nickname,
+        level: e.level,
+        virtualCapital: e.virtualCapital,
+        initialCapital: levelCfg.initialCapital,
+        drawdownPercent: drawdownPct,
+        disqualifiedAt: e.positions
+          .filter(p => p.closeReason === 'drawdown_disqualified' || p.closeReason === 'SL_hit')
+          .sort((a, b) => new Date(b.closedAt) - new Date(a.closedAt))[0]?.closedAt || null,
+        totalPositions: e.positions.length
+      };
+    });
+    res.json({ total: result.length, entries: result });
+  } catch (error) {
+    console.error('❌ Error /admin/disqualified-entries:', error.message);
+    res.status(500).json({ error: 'Error obteniendo entradas descalificadas' });
+  }
+});
+
 app.post('/api/admin/cleanup-bots', authenticateAdmin, async (req, res) => {
   const botPattern = /^test\d+@holypot\.com$/;
   try {
