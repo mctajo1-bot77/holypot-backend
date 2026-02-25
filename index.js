@@ -672,7 +672,11 @@ async function emitLiveData() {
             entryPrice: p.entryPrice,
             livePnl: livePnl.toFixed(4),
             takeProfit: p.takeProfit || null,
-            stopLoss: p.stopLoss || null
+            stopLoss: p.stopLoss || null,
+            closedAt: p.closedAt || null,
+            closeReason: p.closeReason || null,
+            openedAt: p.openedAt,
+            currentPnl: p.closedAt ? (p.currentPnl || 0) : null
           };
         }),
         livePrices: livePrices
@@ -1509,6 +1513,12 @@ app.get('/api/my-positions', authenticateToken, async (req, res) => {
         direction: p.direction,
         lotSize: p.lotSize || 0.01,
         entryPrice: p.entryPrice,
+        takeProfit: p.takeProfit || null,
+        stopLoss: p.stopLoss || null,
+        closedAt: p.closedAt || null,
+        closeReason: p.closeReason || null,
+        openedAt: p.openedAt,
+        currentPnl: p.closedAt ? (p.currentPnl || 0) : null,
         livePnl: livePnl.toFixed(2)
       };
     });
@@ -1601,13 +1611,31 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
       { date: new Date().toLocaleDateString('es-ES'), level: entry.level.toUpperCase(), return: dailyReturn.toFixed(2), position: 0, prize: 0 }
     ];
 
+    // Posiciones cerradas del día (historial de operaciones)
+    const closedPositions = entry.positions
+      .filter(p => p.closedAt)
+      .sort((a, b) => new Date(b.closedAt) - new Date(a.closedAt))
+      .slice(0, 30)
+      .map(p => ({
+        id: p.id,
+        symbol: p.symbol,
+        direction: p.direction,
+        lotSize: p.lotSize || 0.01,
+        entryPrice: p.entryPrice,
+        closeReason: p.closeReason || 'manual',
+        currentPnl: parseFloat(p.currentPnl || 0).toFixed(2),
+        openedAt: p.openedAt,
+        closedAt: p.closedAt
+      }));
+
     res.json({
       nickname: entry.user.nickname || 'Anónimo',
       currentPosition: '#-',
       bestRanking: '#-',
       stats,
       history,
-      liveCapital: Math.floor(liveCapital)
+      liveCapital: Math.floor(liveCapital),
+      closedPositions
     });
   } catch (error) {
     console.error('Error my-profile:', error);
