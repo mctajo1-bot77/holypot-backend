@@ -586,12 +586,14 @@ async function emitLiveData() {
         let reason = '';
 
         if (p.takeProfit || p.stopLoss) {
+          const tp = p.takeProfit ? parseFloat(p.takeProfit) : null;
+          const sl = p.stopLoss ? parseFloat(p.stopLoss) : null;
           if (p.direction === 'long') {
-            if (p.takeProfit && currentPrice >= p.takeProfit) { shouldClose = true; reason = 'TP_hit'; }
-            if (p.stopLoss && currentPrice <= p.stopLoss) { shouldClose = true; reason = 'SL_hit'; }
+            if (tp && currentPrice >= tp) { shouldClose = true; reason = 'TP_hit'; }
+            if (sl && currentPrice <= sl) { shouldClose = true; reason = 'SL_hit'; }
           } else {
-            if (p.takeProfit && currentPrice <= p.takeProfit) { shouldClose = true; reason = 'TP_hit'; }
-            if (p.stopLoss && currentPrice >= p.stopLoss) { shouldClose = true; reason = 'SL_hit'; }
+            if (tp && currentPrice <= tp) { shouldClose = true; reason = 'TP_hit'; }
+            if (sl && currentPrice >= sl) { shouldClose = true; reason = 'SL_hit'; }
           }
         }
 
@@ -1194,8 +1196,8 @@ app.post('/api/create-payment', async (req, res) => {
       const hashedPassword = password ? await bcrypt.hash(password, 10) : undefined;
       user = await prisma.user.upsert({
         where: { email },
-        update: { walletAddress, password: hashedPassword },
-        create: { email, walletAddress, password: hashedPassword }
+        update: { walletAddress, password: hashedPassword, ...(country && { country }) },
+        create: { email, walletAddress, password: hashedPassword, ...(country && { country }) }
       });
     }
 
@@ -1341,7 +1343,7 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
       'EURUSD': { pipValue: 10, pipMultiplier: 10000, displayName: 'EUR/USD' },
       'GBPUSD': { pipValue: 10, pipMultiplier: 10000, displayName: 'GBP/USD' },
       'USDJPY': { pipValue: 9.09, pipMultiplier: 100, displayName: 'USD/JPY' },
-      'XAUUSD': { pipValue: 10, pipMultiplier: 10, displayName: 'Gold' },
+      'XAUUSD': { pipValue: 1, pipMultiplier: 10, displayName: 'Gold' },
       'SPX500': { pipValue: 50, pipMultiplier: 1, displayName: 'S&P 500' },
       'NAS100': { pipValue: 20, pipMultiplier: 1, displayName: 'NASDAQ 100' }
     };
@@ -1692,6 +1694,7 @@ app.get('/api/ranking', async (req, res) => {
 
       return {
         displayName,
+        country: e.user.country || null,
         retorno: retorno.toFixed(2) + "%",
         liveCapital: liveCapital.toString()
       };

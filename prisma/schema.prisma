@@ -14,6 +14,7 @@ model User {
   password      String? // hashed bcrypt
   nickname      String?  @unique // unico
   emailVerified Boolean @default(false)
+  country            String?
   verificationToken  String?  @unique     // ← NUEVO
   tokenExpiry        DateTime?             // ← NUEVO
   entries       Entry[]
