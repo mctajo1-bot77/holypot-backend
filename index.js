@@ -1311,7 +1311,7 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
   if (!['long', 'short'].includes(dir)) return res.status(400).json({ error: "Direction long/short" });
   const currentPrice = getCurrentPrice(symbol);
   if (!currentPrice) return res.status(400).json({ error: "Precio no disponible" });
-  if (lotSize < 0.01 || lotSize > 1.0) return res.status(400).json({ error: "LotSize 0.01-1.0" });
+  if (lotSize < 0.01) return res.status(400).json({ error: "LotSize mínimo: 0.01" });
 
   try {
     // ========== FORZAR EMAIL VERIFICADO PARA OPERAR ==========
@@ -1337,8 +1337,17 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
     });
     if (tradesToday >= 20) return res.status(400).json({ error: "Límite 20 trades/día" });
 
-    const openLot = entry.positions.reduce((sum, p) => sum + (p.lotSize || 0), 0);
-    if (openLot + lotSize > 1.0) return res.status(400).json({ error: "Máximo 1.0 lot total abierto" });
+    // Riesgo actual de todas las posiciones abiertas (suma portafolio)
+    const currentPortfolioRisk = entry.positions.reduce((sum, p) => {
+      if (!p.entryPrice || p.entryPrice === 0) return sum;
+      const lot = p.lotSize || 0.01;
+      if (p.stopLoss) {
+        return sum + lot * (Math.abs(p.entryPrice - p.stopLoss) / p.entryPrice) * 100;
+      }
+      const cfg = instrumentConfig[p.symbol] || instrumentConfig['EURUSD'];
+      const defaultDist = 100 / cfg.pipMultiplier;
+      return sum + lot * (defaultDist / p.entryPrice) * 100;
+    }, 0);
 
     if (takeProfit !== undefined && takeProfit !== null) {
       const tp = parseFloat(takeProfit);
@@ -1370,20 +1379,24 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
     const riskPercent = lotSize * percentMove;
     const riskUSD = (entry.virtualCapital * riskPercent) / 100;
 
-    // Bloquear si el riesgo excede el 10%
-    if (riskPercent > 10) {
+    // Riesgo total portafolio = posiciones abiertas + nueva posición
+    const totalPortfolioRisk = currentPortfolioRisk + riskPercent;
+
+    // Bloquear si el riesgo total supera el 10%
+    if (totalPortfolioRisk > 10) {
       return res.status(400).json({
-        error: `Riesgo ${riskPercent.toFixed(1)}% excede máximo 10%. Reduce lotSize o ajusta SL.`,
+        error: `Riesgo total ${totalPortfolioRisk.toFixed(1)}% excedería el máximo 10%. ` +
+               `(Posiciones abiertas: ${currentPortfolioRisk.toFixed(1)}% + nuevo trade: ${riskPercent.toFixed(1)}%)`,
         details: {
-          riskPercent: riskPercent.toFixed(2),
+          newTradeRisk: riskPercent.toFixed(2),
+          portfolioRisk: currentPortfolioRisk.toFixed(2),
+          totalRisk: totalPortfolioRisk.toFixed(2),
           riskUSD: riskUSD.toFixed(2),
           distancePips: Math.round(distancePips),
           percentMove: percentMove.toFixed(4),
-          symbol: symbol,
-          currentPrice: currentPrice,
-          stopLoss: slPrice,
-          lotSize: lotSize,
-          virtualCapital: entry.virtualCapital
+          symbol, currentPrice, stopLoss: slPrice, lotSize,
+          virtualCapital: entry.virtualCapital,
+          maxLotAllowed: parseFloat(Math.floor((10 - currentPortfolioRisk) / percentMove * 100) / 100).toFixed(2)
         }
       });
     }
