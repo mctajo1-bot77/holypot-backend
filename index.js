@@ -165,6 +165,16 @@ const levelsConfig = {
   premium: { name: "Premium", entryPrice: 107, comision: 7, initialCapital: 100000 }
 };
 
+// Configuración de instrumentos — pipMultiplier para convertir precio a pips (display)
+const instrumentConfig = {
+  'EURUSD': { pipMultiplier: 10000, displayName: 'EUR/USD' },
+  'GBPUSD': { pipMultiplier: 10000, displayName: 'GBP/USD' },
+  'USDJPY': { pipMultiplier: 100,   displayName: 'USD/JPY' },
+  'XAUUSD': { pipMultiplier: 10,    displayName: 'Gold' },
+  'SPX500': { pipMultiplier: 1,     displayName: 'S&P 500' },
+  'NAS100': { pipMultiplier: 1,     displayName: 'NASDAQ 100' }
+};
+
 // Configuración de redes de pago
 const NETWORK_CONFIG = {
   polygon:  { nowpaymentsCurrency: 'usdtpoly',  fee: 0.50,  label: 'Polygon'   },
@@ -1342,36 +1352,33 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
     }
 
     // ✅ VALIDACIÓN DE RIESGO REAL
-    // Configuración de instrumentos (copiar esto al inicio del archivo o importar desde config)
-    const instrumentConfig = {
-      'EURUSD': { pipValue: 10, pipMultiplier: 10000, displayName: 'EUR/USD' },
-      'GBPUSD': { pipValue: 10, pipMultiplier: 10000, displayName: 'GBP/USD' },
-      'USDJPY': { pipValue: 9.09, pipMultiplier: 100, displayName: 'USD/JPY' },
-      'XAUUSD': { pipValue: 1, pipMultiplier: 10, displayName: 'Gold' },
-      'SPX500': { pipValue: 50, pipMultiplier: 1, displayName: 'S&P 500' },
-      'NAS100': { pipValue: 20, pipMultiplier: 1, displayName: 'NASDAQ 100' }
-    };
-
+    // Fórmula consistente con PnL: riskPercent = lotSize × |entry - SL| / entry × 100
+    // lotSize en esta plataforma es fracción del capital (0.01–1.0), NO lotes estándar forex
     const config = instrumentConfig[symbol] || instrumentConfig['EURUSD'];
-    
-    // Calcular distancia en pips/puntos
     const slPrice = stopLoss ? parseFloat(stopLoss) : null;
-    const distancePips = slPrice 
+
+    // Distancia en pips (para display)
+    const distancePips = slPrice
       ? Math.abs(currentPrice - slPrice) * config.pipMultiplier
-      : 100; // Default: asume 100 pips si no hay SL (riesgo máximo estimado)
-    
-    // Calcular riesgo en USD y porcentaje
-    const riskUSD = distancePips * config.pipValue * lotSize;
-    const riskPercent = (riskUSD / entry.virtualCapital) * 100;
+      : 100;
+
+    // Riesgo real: cuánto pierde la cuenta si el SL se toca
+    const priceDistance = slPrice
+      ? Math.abs(currentPrice - slPrice)
+      : 100 / config.pipMultiplier; // 100 pips default convertidos a precio
+    const percentMove = (priceDistance / currentPrice) * 100;
+    const riskPercent = lotSize * percentMove;
+    const riskUSD = (entry.virtualCapital * riskPercent) / 100;
 
     // Bloquear si el riesgo excede el 10%
     if (riskPercent > 10) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: `Riesgo ${riskPercent.toFixed(1)}% excede máximo 10%. Reduce lotSize o ajusta SL.`,
         details: {
           riskPercent: riskPercent.toFixed(2),
           riskUSD: riskUSD.toFixed(2),
           distancePips: Math.round(distancePips),
+          percentMove: percentMove.toFixed(4),
           symbol: symbol,
           currentPrice: currentPrice,
           stopLoss: slPrice,
@@ -1523,7 +1530,19 @@ app.get('/api/my-positions', authenticateToken, async (req, res) => {
       };
     });
 
-    const totalRiskPercent = entry.positions.filter(p => !p.closedAt).reduce((sum, p) => sum + (p.lotSize || 0) * 10, 0);
+    // Riesgo total: suma del riesgo real de cada posición abierta
+    // Fórmula: riskPercent = lotSize × |entryPrice - SL| / entryPrice × 100
+    const totalRiskPercent = entry.positions.filter(p => !p.closedAt).reduce((sum, p) => {
+      const lot = p.lotSize || 0.01;
+      if (!p.entryPrice || p.entryPrice === 0) return sum;
+      if (p.stopLoss) {
+        return sum + lot * (Math.abs(p.entryPrice - p.stopLoss) / p.entryPrice) * 100;
+      }
+      // Sin SL: estimar con 100 pips default convertidos a precio
+      const cfg = instrumentConfig[p.symbol] || instrumentConfig['EURUSD'];
+      const defaultDist = 100 / cfg.pipMultiplier;
+      return sum + lot * (defaultDist / p.entryPrice) * 100;
+    }, 0);
 
     res.json({
       positions: positionsWithLivePnl,
