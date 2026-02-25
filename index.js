@@ -342,8 +342,8 @@ function connectFinnhub() {
       GBPUSD: 'GBP_USD',
       USDJPY: 'USD_JPY',
       XAUUSD: 'XAU_USD',
-      SPX500: 'SPX500',
-      NAS100: 'NAS100'
+      SPX500: 'SPX500_USD',   // OANDA CFD S&P 500 → OANDA:SPX500_USD
+      NAS100: 'NAS100_USD'    // OANDA CFD NASDAQ 100 → OANDA:NAS100_USD
     };
 
     Object.keys(symbols).forEach((key, index) => {
@@ -365,7 +365,10 @@ function connectFinnhub() {
       for (const t of msg.data) {
         let fullSym = t.s;
         let symbol = fullSym.replace('OANDA:', '');
-        symbol = symbol.replace('_USD', 'USD').replace('_JPY', 'JPY');
+        // Los índices usan sufijo _USD pero NO se concatenan (SPX500_USD → SPX500, NAS100_USD → NAS100)
+        if (symbol === 'SPX500_USD') symbol = 'SPX500';
+        else if (symbol === 'NAS100_USD') symbol = 'NAS100';
+        else symbol = symbol.replace('_USD', 'USD').replace('_JPY', 'JPY');
         const price = t.p;
         
         console.log(`💰 Precio actualizado: ${symbol} = ${price}`);
@@ -1277,6 +1280,16 @@ app.post('/api/manual-confirm', authenticateAdmin, async (req, res) => {
 });
 // OPEN TRADE - Actualizado con validación de riesgo real
 app.post('/api/open-trade', authenticateToken, async (req, res) => {
+  // ── Bloquear trading después de las 21:00 UTC (cierre de competición) ──────
+  const nowUTC = new Date();
+  if (nowUTC.getUTCHours() >= 21) {
+    return res.status(400).json({
+      error: 'La competición del día ha cerrado. Las operaciones están bloqueadas hasta las 00:00 UTC.',
+      code: 'COMPETITION_CLOSED'
+    });
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
   const { entryId, symbol, direction, lotSize, takeProfit, stopLoss } = req.body;
   const dir = direction.toLowerCase();
   if (!['long', 'short'].includes(dir)) return res.status(400).json({ error: "Direction long/short" });
@@ -2341,74 +2354,87 @@ cron.schedule('0 21 * * *', async () => {
     });
     console.log('🧹 Velas de ayer limpiadas');
 
-    // GENERACIÓN CONSEJOS IA
-    for (const entry of entriesToday) {
-      let liveCapital = entry.virtualCapital;
-      let openLotTotal = 0;
-      const symbolCount = {};
+    // ── Re-fetch capital final desde DB (los updates de la posición ya se aplicaron) ──
+    const finalEntries = await prisma.entry.findMany({
+      where: { id: { in: entriesToday.map(e => e.id) } },
+      include: { user: { select: { id: true, nickname: true, email: true } }, positions: true }
+    });
 
-      entry.positions.forEach(p => {
-        symbolCount[p.symbol] = (symbolCount[p.symbol] || 0) + 1;
+    // ── Emitir evento competitionEnded a todos los clientes conectados ──────────
+    const competitionResults = {};
+    for (const [level, originalEntries] of Object.entries(byLevel)) {
+      const config = levelsConfig[level];
+      const participants = originalEntries.length;
 
-        if (!p.closedAt) {
-          openLotTotal += p.lotSize || 0;
-          const currentPrice = getCurrentPrice(p.symbol);
-          if (currentPrice) {
-            const sign = p.direction === 'long' ? 1 : -1;
-            const pnlPercent = sign * ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
-            const pnlAmount = entry.virtualCapital * (p.lotSize || 0) * (pnlPercent / 100);
-            liveCapital += pnlAmount;
-          }
-        }
-      });
+      if (participants < 5) {
+        competitionResults[level] = { rollover: true, participants };
+        continue;
+      }
 
-      const initial = levelsConfig[entry.level].initialCapital;
-      const dailyReturn = ((liveCapital - initial) / initial) * 100;
+      const prizePool = participants * config.entryPrice - participants * config.comision;
+      const prizes = [0.5, 0.3, 0.2];
 
-      const buys = entry.positions.filter(p => p.direction === 'long').length;
-      const sells = entry.positions.filter(p => p.direction === 'short').length;
-      const riskUsed = openLotTotal * 10;
-      const topAsset = Object.keys(symbolCount).sort((a, b) => symbolCount[b] - symbolCount[a])[0] || 'Ninguno';
+      const levelFinal = finalEntries.filter(e => e.level === level);
+      const ranked = levelFinal.map(e => ({
+        entryId: e.id,
+        nickname: e.user?.nickname || 'Anónimo',
+        retorno: parseFloat(((e.virtualCapital - config.initialCapital) / config.initialCapital * 100).toFixed(2)),
+        liveCapital: e.virtualCapital,
+      })).sort((a, b) => b.retorno - a.retorno);
 
-      const prompt = `
-Analiza el desempeño del trader ${entry.user.nickname || 'Anónimo'} hoy:
-- Retorno del día: ${dailyReturn.toFixed(2)}%
-- Operaciones LONG: ${buys}
-- Operaciones SHORT: ${sells}
-- Riesgo actualmente usado: ${riskUsed.toFixed(1)}%
+      competitionResults[level] = {
+        rollover: false,
+        participants,
+        prizePool: parseFloat(prizePool.toFixed(2)),
+        top3: ranked.slice(0, 3).map((t, i) => ({
+          ...t,
+          position: i + 1,
+          prize: parseFloat((prizePool * prizes[i]).toFixed(2)),
+        })),
+        ranking: ranked.slice(0, 10),
+      };
+    }
+    io.emit('competitionEnded', competitionResults);
+    console.log('📣 Evento competitionEnded emitido a todos los clientes');
+
+    // GENERACIÓN CONSEJOS IA (con Promise.allSettled para que un error no bloquee el cron)
+    if (!process.env.GROK_API_KEY) {
+      console.warn('⚠️ GROK_API_KEY no definida – consejo IA omitido');
+    } else {
+      await Promise.allSettled(finalEntries.map(async (entry) => {
+        const symbolCount = {};
+        entry.positions.forEach(p => {
+          symbolCount[p.symbol] = (symbolCount[p.symbol] || 0) + 1;
+        });
+
+        const initial = levelsConfig[entry.level]?.initialCapital || 10000;
+        const dailyReturn = ((entry.virtualCapital - initial) / initial) * 100;
+        const buys  = entry.positions.filter(p => p.direction === 'long').length;
+        const sells = entry.positions.filter(p => p.direction === 'short').length;
+        const topAsset = Object.keys(symbolCount).sort((a, b) => symbolCount[b] - symbolCount[a])[0] || 'Ninguno';
+
+        const prompt = `Analiza el desempeño del trader ${entry.user.nickname || 'Anónimo'} hoy:
+- Retorno: ${dailyReturn.toFixed(2)}%
+- LONG: ${buys} | SHORT: ${sells}
 - Activo más operado: ${topAsset}
+Genera un consejo breve y motivador en español (máx 250 caracteres, tono profesional):`;
 
-Genera un consejo breve y motivador en español:
-1. Resumen positivo del día.
-2. 3 sugerencias concretas para mejorar mañana.
-Máximo 250 caracteres, tono entusiasta y profesional.
-`;
-
-      try {
         const response = await axios.post('https://api.x.ai/v1/chat/completions', {
           model: "grok-beta",
           messages: [{ role: "user", content: prompt }],
           temperature: 0.7,
           max_tokens: 300
         }, {
-          headers: {
-            'Authorization': `Bearer ${process.env.GROK_API_KEY}`,
-            'Content-Type': 'application/json'
-          }
+          headers: { 'Authorization': `Bearer ${process.env.GROK_API_KEY}`, 'Content-Type': 'application/json' },
+          timeout: 15000
         });
 
-        const advice = response.data.choices[0].message.content.trim();
-
+        const adviceText = response.data.choices[0].message.content.trim();
         await prisma.advice.create({
-          data: {
-            userId: entry.user.id,
-            date: new Date(),
-            text: advice
-          }
+          data: { userId: entry.user.id, date: new Date(), text: adviceText }
         });
-      } catch (grokError) {
-        console.error('Error Grok API:', grokError.response?.data || grokError.message);
-      }
+        console.log(`💡 Consejo IA generado para ${entry.user.nickname || entry.user.email}`);
+      }));
     }
 
     emitLiveData();
