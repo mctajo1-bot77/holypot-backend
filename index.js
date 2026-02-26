@@ -1669,9 +1669,9 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
       sessionSuccess
     };
 
-    // Historial real: todas las entries del usuario (closed + confirmed) ordenadas por fecha
+    // Historial: solo entries de competencias terminadas (cron marcó 'closed'), excluye la actual
     const allUserEntries = await prisma.entry.findMany({
-      where: { userId: entry.userId, status: { in: ['closed', 'confirmed'] } },
+      where: { userId: entry.userId, status: 'closed', id: { not: entryId } },
       orderBy: { createdAt: 'desc' }
     });
     const userPayouts = await prisma.payout.findMany({
