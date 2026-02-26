@@ -1778,6 +1778,128 @@ app.get('/api/last-winners', async (req, res) => {
   }
 });
 
+// HALL OF FAME – top traders históricos (público, sin auth)
+app.get('/api/hall-of-fame', async (req, res) => {
+  try {
+    const closedEntries = await prisma.entry.findMany({
+      where: { status: 'closed' },
+      include: {
+        user: { select: { id: true, nickname: true, country: true } },
+        positions: { select: { symbol: true } }
+      }
+    });
+
+    const userMap = {};
+    for (const entry of closedEntries) {
+      const uid = entry.userId;
+      if (!userMap[uid]) {
+        userMap[uid] = {
+          nickname: entry.user.nickname || 'Anónimo',
+          country: entry.user.country || 'OTHER',
+          competitions: 0,
+          wins: 0,
+          bestReturn: -Infinity,
+          totalReturn: 0,
+          instrumentCount: {}
+        };
+      }
+      const u = userMap[uid];
+      u.competitions++;
+      const initial = levelsConfig[entry.level]?.initialCapital || 10000;
+      const ret = (entry.virtualCapital - initial) / initial * 100;
+      u.totalReturn += ret;
+      if (ret > u.bestReturn) u.bestReturn = ret;
+      entry.positions.forEach(p => {
+        u.instrumentCount[p.symbol] = (u.instrumentCount[p.symbol] || 0) + 1;
+      });
+    }
+
+    const payouts = await prisma.payout.findMany({
+      where: { status: { in: ['pending', 'sent', 'confirmed'] } },
+      select: { userId: true }
+    });
+    payouts.forEach(p => { if (userMap[p.userId]) userMap[p.userId].wins++; });
+
+    const hallOfFame = Object.values(userMap)
+      .filter(u => u.competitions > 0)
+      .map(u => {
+        const topInstrument = Object.entries(u.instrumentCount).sort((a, b) => b[1] - a[1])[0]?.[0] || '-';
+        return {
+          nickname: u.nickname,
+          country: u.country || 'OTHER',
+          competitions: u.competitions,
+          winRate: Math.round(u.wins / u.competitions * 100),
+          bestReturn: parseFloat((u.bestReturn === -Infinity ? 0 : u.bestReturn).toFixed(2)),
+          avgReturn: parseFloat((u.totalReturn / u.competitions).toFixed(2)),
+          topInstrument
+        };
+      })
+      .sort((a, b) => b.winRate - a.winRate || b.bestReturn - a.bestReturn)
+      .slice(0, 50);
+
+    res.json(hallOfFame);
+  } catch (error) {
+    console.error('Error hall-of-fame:', error);
+    res.status(500).json({ error: 'Error cargando hall of fame' });
+  }
+});
+
+// HISTORIAL DE GANADORES – verificable en blockchain (público, sin auth)
+app.get('/api/winners-history', async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = 30;
+  const skip = (page - 1) * limit;
+  try {
+    const [payouts, total] = await Promise.all([
+      prisma.payout.findMany({
+        where: { status: { in: ['sent', 'confirmed'] } },
+        include: { user: { select: { nickname: true, country: true } } },
+        orderBy: { date: 'desc' },
+        skip,
+        take: limit
+      }),
+      prisma.payout.count({ where: { status: { in: ['sent', 'confirmed'] } } })
+    ]);
+
+    const winners = await Promise.all(payouts.map(async p => {
+      const entry = await prisma.entry.findFirst({
+        where: { userId: p.userId, level: p.level, status: 'closed' },
+        orderBy: { createdAt: 'desc' }
+      });
+      const initial = levelsConfig[p.level]?.initialCapital || 10000;
+      const returnPct = entry
+        ? parseFloat(((entry.virtualCapital - initial) / initial * 100).toFixed(2))
+        : null;
+      const wallet = p.walletAddress;
+      const network = p.network || 'trc20';
+      let explorerUrl = null;
+      if (wallet) {
+        explorerUrl = network === 'polygon'
+          ? `https://polygonscan.com/address/${wallet}`
+          : `https://tronscan.org/#/address/${wallet}`;
+      }
+      return {
+        date: new Date(p.date).toLocaleDateString('es-ES'),
+        level: p.level.toUpperCase(),
+        position: p.position,
+        nickname: p.user?.nickname || 'Anónimo',
+        country: p.user?.country || 'OTHER',
+        return: returnPct,
+        amount: parseFloat(p.amount.toFixed(2)),
+        walletShort: wallet ? `${wallet.slice(0, 6)}...${wallet.slice(-4)}` : '-',
+        network: network.toUpperCase(),
+        explorerUrl,
+        status: p.status
+      };
+    }));
+
+    res.json({ winners, total, pages: Math.ceil(total / limit) || 1, page });
+  } catch (error) {
+    console.error('Error winners-history:', error);
+    res.status(500).json({ error: 'Error cargando historial' });
+  }
+});
+
 // RANKING PÚBLICO
 app.get('/api/ranking', async (req, res) => {
   const { level = 'basic' } = req.query;
