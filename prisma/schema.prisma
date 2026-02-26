@@ -41,13 +41,16 @@ model Entry {
   level          String
   paymentId      String? // ID del pago en NOWPayments
   paymentNetwork String?  @default("polygon") // polygon, trc20, ethereum
-  status         String   @default("pending") // pending, confirmed, disqualified, winner
+  status         String   @default("pending") // pending, confirmed, disqualified, winner, closed
   virtualCapital Float // capital inicial + P&L acumulado
   createdAt      DateTime @default(now())
+  closedAt       DateTime? // fecha de cierre de la competencia (seteado por cron)
+  wasRollover    Boolean  @default(false) // true si esta entrada fue una renovación por rollover
 
   user        User         @relation(fields: [userId], references: [id])
   competition Competition? @relation(fields: [competitionId], references: [id])
-  positions   Position[] // <--- RELACIÓN NUEVA: trades múltiples
+  positions   Position[] // trades
+  payouts     Payout[]   // premios ganados en esta entrada
 }
 
 model Advice {
@@ -79,6 +82,7 @@ model Position {
 model Payout {
   id            Int          @id @default(autoincrement())
   userId        String
+  entryId       String?      // link a Entry para trazabilidad correcta
   level         String
   position      Int
   amount        Float
@@ -90,6 +94,7 @@ model Payout {
   batchId       Int?
 
   user          User         @relation(fields: [userId], references: [id])
+  entry         Entry?       @relation(fields: [entryId], references: [id])
   batch         PayoutBatch? @relation(fields: [batchId], references: [id])
 }
 

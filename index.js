@@ -1220,6 +1220,20 @@ app.post('/api/create-payment', async (req, res) => {
       });
     }
 
+    // ── Prevenir múltiples entradas activas para el mismo usuario ──────────
+    const existingConfirmed = await prisma.entry.findFirst({
+      where: { userId: user.id, status: 'confirmed' }
+    });
+    if (existingConfirmed) {
+      const token2 = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+      return res.status(400).json({
+        error: 'Ya tienes una competencia activa. Espera a que termine para inscribirte de nuevo.',
+        code: 'ACTIVE_ENTRY_EXISTS',
+        token: token2,
+        entryId: existingConfirmed.id
+      });
+    }
+
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 
     const response = await axios.post(`${NOWPAYMENTS_API}/invoice`, {
@@ -1672,27 +1686,27 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
     // Historial: solo entries de competencias terminadas (cron marcó 'closed'), excluye la actual
     const allUserEntries = await prisma.entry.findMany({
       where: { userId: entry.userId, status: 'closed', id: { not: entryId } },
-      orderBy: { createdAt: 'desc' }
-    });
-    const userPayouts = await prisma.payout.findMany({
-      where: { userId: entry.userId, status: { in: ['pending', 'sent', 'confirmed'] } },
-      orderBy: { date: 'desc' }
+      include: { payouts: { where: { status: { in: ['pending', 'sent', 'confirmed'] } } } },
+      orderBy: { closedAt: 'desc' }
     });
     const history = allUserEntries.map(e => {
       const initialCap = levelsConfig[e.level]?.initialCapital || 10000;
       const entryReturn = ((e.virtualCapital - initialCap) / initialCap * 100).toFixed(2);
-      // Buscar payout del mismo nivel y día (máx 2 días de diferencia por zona horaria)
-      const entryDate = new Date(e.createdAt).getTime();
-      const matchPayout = userPayouts.find(p =>
-        p.level === e.level && Math.abs(new Date(p.date).getTime() - entryDate) < 172800000
-      );
+      // Usar el payout directamente vinculado por entryId (relación directa, sin fuzzy matching)
+      const matchPayout = e.payouts?.[0] || null;
+      // Mostrar la fecha de cierre de la competencia (no de creación del pago)
+      const displayDate = e.closedAt
+        ? new Date(e.closedAt).toLocaleDateString('es-ES')
+        : new Date(e.createdAt).toLocaleDateString('es-ES');
       return {
-        date: new Date(e.createdAt).toLocaleDateString('es-ES'),
+        date: displayDate,
+        paymentDate: new Date(e.createdAt).toLocaleDateString('es-ES'),
         level: e.level.toUpperCase(),
         return: entryReturn,
         position: matchPayout?.position || 0,
         prize: matchPayout?.amount || 0,
-        status: e.status
+        status: e.status,
+        wasRollover: e.wasRollover || false
       };
     });
 
@@ -1775,6 +1789,55 @@ app.get('/api/last-winners', async (req, res) => {
   } catch (error) {
     console.error('Error last-winners:', error);
     res.status(500).json({ error: 'Error cargando ganadores' });
+  }
+});
+
+// LAST COMPETITION RESULTS – ranking final de la última competencia cerrada por nivel
+app.get('/api/last-competition-results', async (req, res) => {
+  try {
+    const results = {};
+    for (const level of Object.keys(levelsConfig)) {
+      const config = levelsConfig[level];
+      // Encontrar el closedAt más reciente para este nivel
+      const lastClosed = await prisma.entry.findFirst({
+        where: { level, status: 'closed', closedAt: { not: null } },
+        orderBy: { closedAt: 'desc' }
+      });
+      if (!lastClosed) {
+        results[level] = { hasData: false };
+        continue;
+      }
+      // Buscar todas las entradas cerradas en esa misma sesión (mismo closedAt ± 5 min)
+      const closedAt = new Date(lastClosed.closedAt);
+      const from = new Date(closedAt.getTime() - 5 * 60 * 1000);
+      const to   = new Date(closedAt.getTime() + 5 * 60 * 1000);
+      const entries = await prisma.entry.findMany({
+        where: { level, status: 'closed', closedAt: { gte: from, lte: to } },
+        include: { user: { select: { nickname: true } }, payouts: true }
+      });
+      const initial = config.initialCapital;
+      const participants = entries.length;
+      const prizePool = participants * config.entryPrice - participants * config.comision;
+      const ranked = entries.map(e => ({
+        entryId: e.id,
+        nickname: e.user?.nickname || 'Anónimo',
+        retorno: parseFloat(((e.virtualCapital - initial) / initial * 100).toFixed(2)),
+        prize: e.payouts?.[0]?.amount || 0
+      })).sort((a, b) => b.retorno - a.retorno);
+
+      results[level] = {
+        hasData: true,
+        date: closedAt.toLocaleDateString('es-ES'),
+        participants,
+        prizePool: parseFloat(prizePool.toFixed(2)),
+        ranking: ranked.map((r, i) => ({ ...r, position: i + 1 })),
+        top3: ranked.slice(0, 3).map((r, i) => ({ ...r, position: i + 1 }))
+      };
+    }
+    res.json(results);
+  } catch (error) {
+    console.error('Error last-competition-results:', error);
+    res.status(500).json({ error: 'Error cargando resultados' });
   }
 });
 
@@ -2532,7 +2595,7 @@ cron.schedule('0 21 * * *', async () => {
         for (const entry of entries) {
           await prisma.entry.update({
             where: { id: entry.id },
-            data: { virtualCapital: config.initialCapital }
+            data: { virtualCapital: config.initialCapital, wasRollover: true }
           });
         }
         continue;
@@ -2566,6 +2629,7 @@ cron.schedule('0 21 * * *', async () => {
         await prisma.payout.create({
           data: {
             userId: winner.entry.userId,
+            entryId: winner.entry.id,
             level,
             position: i + 1,
             amount: prizeAmount,
@@ -2578,10 +2642,10 @@ cron.schedule('0 21 * * *', async () => {
         console.log(`💾 ${i+1}º ${level.toUpperCase()}: ${winner.entry.user.nickname || winner.entry.user.email} – ${prizeAmount.toFixed(2)} USDT neto (${winnerNetwork}) – pendiente batch`);
       }
 
-      // Marcar todas las entries de este nivel como cerradas
+      // Marcar todas las entries de este nivel como cerradas (con fecha de cierre)
       await prisma.entry.updateMany({
         where: { id: { in: entries.map(e => e.id) } },
-        data: { status: 'closed' }
+        data: { status: 'closed', closedAt: new Date() }
       });
       console.log(`✅ Competencia ${level.toUpperCase()} cerrada + ${totalPrizesToPay} payouts en cola para batch`);
     }
