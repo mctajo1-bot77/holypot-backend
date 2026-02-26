@@ -106,6 +106,11 @@ io.on('connection', (socket) => {
   const userId = socket.user?.userId || 'anon';
   console.log(`🔌 Socket conectado: ${socket.id} (user: ${userId})`);
 
+  // Unirse a sala personal para eventos por usuario (ej. myAdvice)
+  if (socket.user?.userId) {
+    socket.join(socket.user.userId);
+  }
+
   socket.on('disconnect', () => {
     console.log(`🔌 Socket desconectado: ${socket.id}`);
   });
@@ -1628,20 +1633,68 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
       .slice(0, 3)
       .map(([symbol, count]) => ({ symbol, buys: entry.positions.filter(p => p.symbol === symbol && p.direction === 'long').length, sells: count - entry.positions.filter(p => p.symbol === symbol && p.direction === 'long').length }));
 
+    // Wins y losses reales a partir del PnL de posiciones cerradas
+    const closedAll = entry.positions.filter(p => p.closedAt);
+    const wins   = closedAll.filter(p => parseFloat(p.currentPnl || 0) > 0).length;
+    const losses = closedAll.filter(p => parseFloat(p.currentPnl || 0) <= 0).length;
+
+    // Tasa de éxito por sesión horaria (UTC)
+    const sessionRanges = { 'Asia': [0, 9], 'London': [7, 16], 'New York': [12, 21] };
+    const sessionBuckets = {};
+    closedAll.forEach(p => {
+      const hour = new Date(p.openedAt).getUTCHours();
+      for (const [name, [start, end]] of Object.entries(sessionRanges)) {
+        if (hour >= start && hour < end) {
+          if (!sessionBuckets[name]) sessionBuckets[name] = { wins: 0, total: 0 };
+          sessionBuckets[name].total++;
+          if (parseFloat(p.currentPnl || 0) > 0) sessionBuckets[name].wins++;
+        }
+      }
+    });
+    const sessionSuccess = Object.entries(sessionBuckets).map(([session, { wins: w, total }]) => ({
+      session,
+      success: total > 0 ? parseFloat((w / total * 100).toFixed(1)) : 0,
+      total
+    }));
+
     const stats = {
       dailyReturn: dailyReturn.toFixed(2),
       buys,
       sells,
       moreBuys: buys > sells,
-      wins: Math.round(Math.random() * 50),
-      losses: Math.round(Math.random() * 20),
+      wins,
+      losses,
       totalTrades,
-      topAssets
+      topAssets,
+      sessionSuccess
     };
 
-    const history = [
-      { date: new Date().toLocaleDateString('es-ES'), level: entry.level.toUpperCase(), return: dailyReturn.toFixed(2), position: 0, prize: 0 }
-    ];
+    // Historial real: todas las entries del usuario (closed + confirmed) ordenadas por fecha
+    const allUserEntries = await prisma.entry.findMany({
+      where: { userId: entry.userId, status: { in: ['closed', 'confirmed'] } },
+      orderBy: { createdAt: 'desc' }
+    });
+    const userPayouts = await prisma.payout.findMany({
+      where: { userId: entry.userId, status: { in: ['pending', 'sent', 'confirmed'] } },
+      orderBy: { date: 'desc' }
+    });
+    const history = allUserEntries.map(e => {
+      const initialCap = levelsConfig[e.level]?.initialCapital || 10000;
+      const entryReturn = ((e.virtualCapital - initialCap) / initialCap * 100).toFixed(2);
+      // Buscar payout del mismo nivel y día (máx 2 días de diferencia por zona horaria)
+      const entryDate = new Date(e.createdAt).getTime();
+      const matchPayout = userPayouts.find(p =>
+        p.level === e.level && Math.abs(new Date(p.date).getTime() - entryDate) < 172800000
+      );
+      return {
+        date: new Date(e.createdAt).toLocaleDateString('es-ES'),
+        level: e.level.toUpperCase(),
+        return: entryReturn,
+        position: matchPayout?.position || 0,
+        prize: matchPayout?.amount || 0,
+        status: e.status
+      };
+    });
 
     // Posiciones cerradas del día (historial de operaciones)
     const closedPositions = entry.positions
@@ -2403,6 +2456,11 @@ cron.schedule('0 21 * * *', async () => {
         console.log(`💾 ${i+1}º ${level.toUpperCase()}: ${winner.entry.user.nickname || winner.entry.user.email} – ${prizeAmount.toFixed(2)} USDT neto (${winnerNetwork}) – pendiente batch`);
       }
 
+      // Marcar todas las entries de este nivel como cerradas
+      await prisma.entry.updateMany({
+        where: { id: { in: entries.map(e => e.id) } },
+        data: { status: 'closed' }
+      });
       console.log(`✅ Competencia ${level.toUpperCase()} cerrada + ${totalPrizesToPay} payouts en cola para batch`);
     }
 
@@ -2480,13 +2538,13 @@ cron.schedule('0 21 * * *', async () => {
 - Retorno: ${dailyReturn.toFixed(2)}%
 - LONG: ${buys} | SHORT: ${sells}
 - Activo más operado: ${topAsset}
-Genera un consejo breve y motivador en español (máx 250 caracteres, tono profesional):`;
+Genera exactamente 3 consejos numerados (1. 2. 3.) breves y accionables en español (máx 80 caracteres cada uno, tono profesional). Solo los 3 puntos, sin introducción ni cierre.`;
 
         const response = await axios.post('https://api.x.ai/v1/chat/completions', {
           model: "grok-beta",
           messages: [{ role: "user", content: prompt }],
           temperature: 0.7,
-          max_tokens: 300
+          max_tokens: 350
         }, {
           headers: { 'Authorization': `Bearer ${process.env.GROK_API_KEY}`, 'Content-Type': 'application/json' },
           timeout: 15000
@@ -2496,7 +2554,9 @@ Genera un consejo breve y motivador en español (máx 250 caracteres, tono profe
         await prisma.advice.create({
           data: { userId: entry.user.id, date: new Date(), text: adviceText }
         });
-        console.log(`💡 Consejo IA generado para ${entry.user.nickname || entry.user.email}`);
+        // Emitir consejo directamente al socket del usuario (sala personal)
+        io.to(entry.user.id).emit('myAdvice', { text: adviceText });
+        console.log(`💡 3 consejos IA generados y emitidos para ${entry.user.nickname || entry.user.email}`);
       }));
     }
 
