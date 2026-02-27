@@ -71,6 +71,9 @@ model Position {
   direction   String
   lotSize     Float?
   entryPrice  Float
+  orderType   String    @default("market")  // market, limit, stop
+  targetPrice Float?                         // precio objetivo para órdenes limit/stop
+  orderStatus String    @default("filled")  // filled, pending, cancelled
   takeProfit  Float? // opcional
   stopLoss    Float? // opcional
   closeReason String? // "manual", "TP_hit", "SL_hit"
