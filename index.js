@@ -580,9 +580,11 @@ async function emitLiveData() {
     const dataToEmit = await Promise.all(entries.map(async (entry) => {
       let liveCapital = entry.virtualCapital;
 
-      const openPositions = entry.positions.filter(p => !p.closedAt);
+      // Solo posiciones FILLED contribuyen al PnL (las pending aún no están activas)
+      const filledPositions = entry.positions.filter(p => !p.closedAt && p.orderStatus !== 'pending');
+      const pendingOrders   = entry.positions.filter(p => !p.closedAt && p.orderStatus === 'pending');
 
-      openPositions.forEach(p => {
+      filledPositions.forEach(p => {
         const currentPrice = getCurrentPrice(p.symbol);
         if (currentPrice && p.entryPrice) {
           const sign = p.direction === 'long' ? 1 : -1;
@@ -592,8 +594,44 @@ async function emitLiveData() {
         }
       });
 
-      // CIERRE AUTOMÁTICO TP/SL
-      await Promise.all(openPositions.map(async (p) => {
+      // ACTIVAR ÓRDENES PENDIENTES cuando el precio alcanza el objetivo
+      await Promise.all(pendingOrders.map(async (p) => {
+        const currentPrice = getCurrentPrice(p.symbol);
+        if (!currentPrice || !p.targetPrice) return;
+
+        let shouldTrigger = false;
+        const target = parseFloat(p.targetPrice);
+
+        if (p.orderType === 'limit') {
+          // Buy Limit: activa cuando precio baja hasta el objetivo
+          // Sell Limit: activa cuando precio sube hasta el objetivo
+          if (p.direction === 'long'  && currentPrice <= target) shouldTrigger = true;
+          if (p.direction === 'short' && currentPrice >= target) shouldTrigger = true;
+        } else if (p.orderType === 'stop') {
+          // Buy Stop: activa cuando precio sube hasta el objetivo
+          // Sell Stop: activa cuando precio baja hasta el objetivo
+          if (p.direction === 'long'  && currentPrice >= target) shouldTrigger = true;
+          if (p.direction === 'short' && currentPrice <= target) shouldTrigger = true;
+        }
+
+        if (shouldTrigger) {
+          await prisma.position.update({
+            where: { id: p.id },
+            data: { orderStatus: 'filled', entryPrice: target }
+          });
+          io.emit('orderTriggered', {
+            entryId: entry.id,
+            positionId: p.id,
+            symbol: p.symbol,
+            direction: p.direction,
+            orderType: p.orderType,
+            entryPrice: target
+          });
+        }
+      }));
+
+      // CIERRE AUTOMÁTICO TP/SL (solo para posiciones filled)
+      await Promise.all(filledPositions.map(async (p) => {
         const currentPrice = getCurrentPrice(p.symbol);
         if (!currentPrice) return;
 
@@ -640,8 +678,7 @@ async function emitLiveData() {
           if (entry.status === 'confirmed') {
             const levelCfg = levelsConfig[entry.level];
             if (levelCfg && newCapital < levelCfg.initialCapital * 0.90) {
-              // Cerrar todas las posiciones abiertas restantes
-              const remaining = openPositions.filter(op => op.id !== p.id && !op.closedAt);
+              const remaining = filledPositions.filter(op => op.id !== p.id && !op.closedAt);
               for (const op of remaining) {
                 const opPrice = getCurrentPrice(op.symbol);
                 const opPnl = opPrice && op.entryPrice
@@ -650,6 +687,13 @@ async function emitLiveData() {
                 await prisma.position.update({
                   where: { id: op.id },
                   data: { closedAt: new Date(), currentPnl: opPnl, closeReason: 'drawdown_disqualified' }
+                });
+              }
+              // Cancelar también las pending orders del usuario
+              for (const op of pendingOrders) {
+                await prisma.position.update({
+                  where: { id: op.id },
+                  data: { closedAt: new Date(), orderStatus: 'cancelled', closeReason: 'drawdown_disqualified' }
                 });
               }
               await prisma.entry.update({
@@ -675,7 +719,8 @@ async function emitLiveData() {
         liveCapital: liveCapitalInt,
         positions: entry.positions.map(p => {
           const currentPrice = getCurrentPrice(p.symbol);
-          const livePnl = !p.closedAt && currentPrice && p.entryPrice
+          const isPending = p.orderStatus === 'pending';
+          const livePnl = !p.closedAt && !isPending && currentPrice && p.entryPrice
             ? (p.direction === 'long' ? 1 : -1) * ((currentPrice - p.entryPrice) / p.entryPrice) * 100
             : (p.currentPnl || 0);
 
@@ -685,6 +730,9 @@ async function emitLiveData() {
             direction: p.direction,
             lotSize: p.lotSize || 0.01,
             entryPrice: p.entryPrice,
+            orderType: p.orderType || 'market',
+            targetPrice: p.targetPrice || null,
+            orderStatus: p.orderStatus || 'filled',
             livePnl: livePnl.toFixed(4),
             takeProfit: p.takeProfit || null,
             stopLoss: p.stopLoss || null,
@@ -1325,12 +1373,29 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
   }
   // ──────────────────────────────────────────────────────────────────────────
 
-  const { entryId, symbol, direction, lotSize, takeProfit, stopLoss } = req.body;
+  const { entryId, symbol, direction, lotSize, orderType = 'market', targetPrice, takeProfit, stopLoss } = req.body;
   const dir = direction.toLowerCase();
   if (!['long', 'short'].includes(dir)) return res.status(400).json({ error: "Direction long/short" });
   const currentPrice = getCurrentPrice(symbol);
   if (!currentPrice) return res.status(400).json({ error: "Precio no disponible" });
   if (lotSize < 0.01) return res.status(400).json({ error: "LotSize mínimo: 0.01" });
+
+  // Validar precio objetivo para órdenes limit/stop
+  let effectiveEntryPrice = currentPrice; // precio al que se abrirá el trade
+  if (orderType !== 'market') {
+    if (!targetPrice) return res.status(400).json({ error: "targetPrice requerido para órdenes Limit/Stop" });
+    const tp = parseFloat(targetPrice);
+    if (isNaN(tp) || tp <= 0) return res.status(400).json({ error: "targetPrice inválido" });
+    if (orderType === 'limit') {
+      if (dir === 'long'  && tp >= currentPrice) return res.status(400).json({ error: "Buy Limit: el precio objetivo debe ser MENOR al precio actual" });
+      if (dir === 'short' && tp <= currentPrice) return res.status(400).json({ error: "Sell Limit: el precio objetivo debe ser MAYOR al precio actual" });
+    }
+    if (orderType === 'stop') {
+      if (dir === 'long'  && tp <= currentPrice) return res.status(400).json({ error: "Buy Stop: el precio objetivo debe ser MAYOR al precio actual" });
+      if (dir === 'short' && tp >= currentPrice) return res.status(400).json({ error: "Sell Stop: el precio objetivo debe ser MENOR al precio actual" });
+    }
+    effectiveEntryPrice = tp; // el trade se abrirá en el target price cuando se dispare
+  }
 
   try {
     // ========== FORZAR EMAIL VERIFICADO PARA OPERAR ==========
@@ -1356,9 +1421,10 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
     });
     if (tradesToday >= 20) return res.status(400).json({ error: "Límite 20 trades/día" });
 
-    // Riesgo actual de todas las posiciones abiertas (suma portafolio)
+    // Riesgo actual: solo contar posiciones filled (no las pendientes que aún no se activaron)
     const currentPortfolioRisk = entry.positions.reduce((sum, p) => {
       if (!p.entryPrice || p.entryPrice === 0) return sum;
+      if (p.orderStatus === 'pending') return sum; // no contar pending orders
       const lot = p.lotSize || 0.01;
       if (p.stopLoss) {
         return sum + lot * (Math.abs(p.entryPrice - p.stopLoss) / p.entryPrice) * 100;
@@ -1368,40 +1434,35 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
       return sum + lot * (defaultDist / p.entryPrice) * 100;
     }, 0);
 
+    // Validar TP y SL contra el precio de entrada efectivo (targetPrice para limit/stop, currentPrice para market)
     if (takeProfit !== undefined && takeProfit !== null) {
-      const tp = parseFloat(takeProfit);
-      if (dir === 'long' && tp <= currentPrice) return res.status(400).json({ error: "TP debe ser mayor al precio actual en LONG" });
-      if (dir === 'short' && tp >= currentPrice) return res.status(400).json({ error: "TP debe ser menor al precio actual en SHORT" });
+      const tpVal = parseFloat(takeProfit);
+      if (dir === 'long'  && tpVal <= effectiveEntryPrice) return res.status(400).json({ error: "TP debe ser mayor al precio de entrada en LONG" });
+      if (dir === 'short' && tpVal >= effectiveEntryPrice) return res.status(400).json({ error: "TP debe ser menor al precio de entrada en SHORT" });
     }
     if (stopLoss !== undefined && stopLoss !== null) {
-      const sl = parseFloat(stopLoss);
-      if (dir === 'long' && sl >= currentPrice) return res.status(400).json({ error: "SL debe ser menor al precio actual en LONG" });
-      if (dir === 'short' && sl <= currentPrice) return res.status(400).json({ error: "SL debe ser mayor al precio actual en SHORT" });
+      const slVal = parseFloat(stopLoss);
+      if (dir === 'long'  && slVal >= effectiveEntryPrice) return res.status(400).json({ error: "SL debe ser menor al precio de entrada en LONG" });
+      if (dir === 'short' && slVal <= effectiveEntryPrice) return res.status(400).json({ error: "SL debe ser mayor al precio de entrada en SHORT" });
     }
 
-    // ✅ VALIDACIÓN DE RIESGO REAL
-    // Fórmula consistente con PnL: riskPercent = lotSize × |entry - SL| / entry × 100
-    // lotSize en esta plataforma es fracción del capital (0.01–1.0), NO lotes estándar forex
+    // ✅ VALIDACIÓN DE RIESGO REAL (usando effectiveEntryPrice)
     const config = instrumentConfig[symbol] || instrumentConfig['EURUSD'];
     const slPrice = stopLoss ? parseFloat(stopLoss) : null;
 
-    // Distancia en pips (para display)
     const distancePips = slPrice
-      ? Math.abs(currentPrice - slPrice) * config.pipMultiplier
+      ? Math.abs(effectiveEntryPrice - slPrice) * config.pipMultiplier
       : 100;
 
-    // Riesgo real: cuánto pierde la cuenta si el SL se toca
     const priceDistance = slPrice
-      ? Math.abs(currentPrice - slPrice)
-      : 100 / config.pipMultiplier; // 100 pips default convertidos a precio
-    const percentMove = (priceDistance / currentPrice) * 100;
+      ? Math.abs(effectiveEntryPrice - slPrice)
+      : 100 / config.pipMultiplier;
+    const percentMove = (priceDistance / effectiveEntryPrice) * 100;
     const riskPercent = lotSize * percentMove;
     const riskUSD = (entry.virtualCapital * riskPercent) / 100;
 
-    // Riesgo total portafolio = posiciones abiertas + nueva posición
     const totalPortfolioRisk = currentPortfolioRisk + riskPercent;
 
-    // Bloquear si el riesgo total supera el 10%
     if (totalPortfolioRisk > 10) {
       return res.status(400).json({
         error: `Riesgo total ${totalPortfolioRisk.toFixed(1)}% excedería el máximo 10%. ` +
@@ -1412,34 +1473,40 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
           totalRisk: totalPortfolioRisk.toFixed(2),
           riskUSD: riskUSD.toFixed(2),
           distancePips: Math.round(distancePips),
-          percentMove: percentMove.toFixed(4),
-          symbol, currentPrice, stopLoss: slPrice, lotSize,
+          symbol, currentPrice: effectiveEntryPrice, stopLoss: slPrice, lotSize,
           virtualCapital: entry.virtualCapital,
           maxLotAllowed: parseFloat(Math.floor((10 - currentPortfolioRisk) / percentMove * 100) / 100).toFixed(2)
         }
       });
     }
 
-    // ✅ Crear la posición (incluyendo datos de riesgo calculados)
+    const isPending = orderType !== 'market';
+
+    // ✅ Crear la posición
     await prisma.position.create({
       data: {
         entryId,
         symbol,
         direction: dir,
         lotSize,
-        entryPrice: currentPrice,
+        entryPrice: effectiveEntryPrice,  // targetPrice para limit/stop; currentPrice para market
+        orderType: orderType || 'market',
+        targetPrice: isPending ? effectiveEntryPrice : null,
+        orderStatus: isPending ? 'pending' : 'filled',
         takeProfit: takeProfit ? parseFloat(takeProfit) : null,
         stopLoss: stopLoss ? parseFloat(stopLoss) : null,
-        // Opcional: guardar el riesgo calculado para referencia
-        // calculatedRiskPercent: riskPercent,
-        // calculatedRiskUSD: riskUSD
       }
     });
 
     emitLiveData();
 
-    res.json({ 
-      message: `¡Trade abierto! ${dir.toUpperCase()} ${symbol} ${lotSize} lot a ${currentPrice.toFixed(2)}`,
+    const msg = isPending
+      ? `¡Orden ${orderType} colocada! ${dir.toUpperCase()} ${symbol} ${lotSize} lot a ${effectiveEntryPrice.toFixed(5)} (en espera)`
+      : `¡Trade abierto! ${dir.toUpperCase()} ${symbol} ${lotSize} lot a ${currentPrice.toFixed(5)}`;
+
+    res.json({
+      message: msg,
+      orderStatus: isPending ? 'pending' : 'filled',
       riskInfo: {
         riskPercent: riskPercent.toFixed(2),
         riskUSD: riskUSD.toFixed(2),
@@ -1486,6 +1553,32 @@ app.post('/api/close-trade', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: "Error close trade", details: error.message });
+  }
+});
+
+// CANCEL PENDING ORDER
+app.post('/api/cancel-pending-order', authenticateToken, async (req, res) => {
+  const { positionId } = req.body;
+  if (!positionId) return res.status(400).json({ error: "positionId required" });
+
+  try {
+    const position = await prisma.position.findUnique({
+      where: { id: positionId },
+      include: { entry: true }
+    });
+    if (!position) return res.status(404).json({ error: "Orden no encontrada" });
+    if (position.orderStatus !== 'pending') return res.status(400).json({ error: "La orden ya fue ejecutada o cancelada" });
+    if (position.entry.userId !== req.user.userId) return res.status(403).json({ error: "No autorizado" });
+
+    await prisma.position.update({
+      where: { id: positionId },
+      data: { closedAt: new Date(), orderStatus: 'cancelled', closeReason: 'cancelled_by_user' }
+    });
+
+    emitLiveData();
+    res.json({ message: "Orden pendiente cancelada" });
+  } catch (error) {
+    res.status(500).json({ error: "Error al cancelar orden", details: error.message });
   }
 });
 
@@ -1539,8 +1632,9 @@ app.get('/api/my-positions', authenticateToken, async (req, res) => {
 
     const positionsWithLivePnl = entry.positions.map(p => {
       const currentPrice = getCurrentPrice(p.symbol);
+      const isPending = p.orderStatus === 'pending';
       let livePnl = p.currentPnl || 0;
-      if (!p.closedAt && currentPrice && p.entryPrice) {
+      if (!p.closedAt && !isPending && currentPrice && p.entryPrice) {
         const sign = p.direction === 'long' ? 1 : -1;
         livePnl = sign * ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
         const pnlAmount = entry.virtualCapital * (p.lotSize || 0) * (livePnl / 100);
@@ -1552,6 +1646,9 @@ app.get('/api/my-positions', authenticateToken, async (req, res) => {
         direction: p.direction,
         lotSize: p.lotSize || 0.01,
         entryPrice: p.entryPrice,
+        orderType: p.orderType || 'market',
+        targetPrice: p.targetPrice || null,
+        orderStatus: p.orderStatus || 'filled',
         takeProfit: p.takeProfit || null,
         stopLoss: p.stopLoss || null,
         closedAt: p.closedAt || null,
@@ -1562,15 +1659,13 @@ app.get('/api/my-positions', authenticateToken, async (req, res) => {
       };
     });
 
-    // Riesgo total: suma del riesgo real de cada posición abierta
-    // Fórmula: riskPercent = lotSize × |entryPrice - SL| / entryPrice × 100
-    const totalRiskPercent = entry.positions.filter(p => !p.closedAt).reduce((sum, p) => {
+    // Riesgo total: suma del riesgo real de cada posición abierta FILLED (no pending)
+    const totalRiskPercent = entry.positions.filter(p => !p.closedAt && p.orderStatus !== 'pending').reduce((sum, p) => {
       const lot = p.lotSize || 0.01;
       if (!p.entryPrice || p.entryPrice === 0) return sum;
       if (p.stopLoss) {
         return sum + lot * (Math.abs(p.entryPrice - p.stopLoss) / p.entryPrice) * 100;
       }
-      // Sin SL: estimar con 100 pips default convertidos a precio
       const cfg = instrumentConfig[p.symbol] || instrumentConfig['EURUSD'];
       const defaultDist = 100 / cfg.pipMultiplier;
       return sum + lot * (defaultDist / p.entryPrice) * 100;
