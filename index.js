@@ -1892,25 +1892,27 @@ app.get('/api/last-winners', async (req, res) => {
 
       const initial = levelsConfig[level].initialCapital;
 
-      const ranking = entries.map(e => {
-        let liveCapital = e.virtualCapital;
-        e.positions.filter(p => !p.closedAt).forEach(p => {
-          const currentPrice = getCurrentPrice(p.symbol);
-          if (currentPrice && p.entryPrice) {
-            const sign = p.direction === 'long' ? 1 : -1;
-            const pnlPercent = sign * ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
-            const pnlAmount = e.virtualCapital * (p.lotSize || 0) * (pnlPercent / 100);
-            liveCapital += pnlAmount;
-          }
+      const ranking = entries
+        .filter(e => e.positions.length > 0)
+        .map(e => {
+          let liveCapital = e.virtualCapital;
+          e.positions.filter(p => !p.closedAt).forEach(p => {
+            const currentPrice = getCurrentPrice(p.symbol);
+            if (currentPrice && p.entryPrice) {
+              const sign = p.direction === 'long' ? 1 : -1;
+              const pnlPercent = sign * ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
+              const pnlAmount = e.virtualCapital * (p.lotSize || 0) * (pnlPercent / 100);
+              liveCapital += pnlAmount;
+            }
+          });
+          const retorno = ((liveCapital - initial) / initial) * 100;
+          return {
+            position: 0,
+            nickname: e.user.nickname || 'Anónimo',
+            prize: 0,
+            retorno
+          };
         });
-        const retorno = ((liveCapital - initial) / initial) * 100;
-        return {
-          position: 0,
-          nickname: e.user.nickname || 'Anónimo',
-          prize: 0,
-          retorno
-        };
-      });
 
       ranking.sort((a, b) => b.retorno - a.retorno);
 
@@ -1994,7 +1996,7 @@ app.get('/api/hall-of-fame', async (req, res) => {
     });
 
     const userMap = {};
-    for (const entry of closedEntries) {
+    for (const entry of closedEntries.filter(e => e.positions.length > 0)) {
       const uid = entry.userId;
       if (!userMap[uid]) {
         userMap[uid] = {
@@ -2117,27 +2119,29 @@ app.get('/api/ranking', async (req, res) => {
 
     const initial = levelsConfig[level].initialCapital;
 
-    const ranking = entries.map(e => {
-      let liveCapital = e.virtualCapital;
-      e.positions.filter(p => !p.closedAt).forEach(p => {
-        const currentPrice = getCurrentPrice(p.symbol);
-        if (currentPrice && p.entryPrice) {
-          const sign = p.direction === 'long' ? 1 : -1;
-          const pnlPercent = sign * ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
-          const pnlAmount = e.virtualCapital * (p.lotSize || 0) * (pnlPercent / 100);
-          liveCapital += pnlAmount;
-        }
-      });
-      const retorno = ((liveCapital - initial) / initial) * 100;
-      const displayName = e.user.nickname || 'Anónimo';
+    const ranking = entries
+      .filter(e => e.positions.length > 0)
+      .map(e => {
+        let liveCapital = e.virtualCapital;
+        e.positions.filter(p => !p.closedAt).forEach(p => {
+          const currentPrice = getCurrentPrice(p.symbol);
+          if (currentPrice && p.entryPrice) {
+            const sign = p.direction === 'long' ? 1 : -1;
+            const pnlPercent = sign * ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
+            const pnlAmount = e.virtualCapital * (p.lotSize || 0) * (pnlPercent / 100);
+            liveCapital += pnlAmount;
+          }
+        });
+        const retorno = ((liveCapital - initial) / initial) * 100;
+        const displayName = e.user.nickname || 'Anónimo';
 
-      return {
-        displayName,
-        country: e.user.country || null,
-        retorno: retorno.toFixed(2) + "%",
-        liveCapital: liveCapital.toString()
-      };
-    });
+        return {
+          displayName,
+          country: e.user.country || null,
+          retorno: retorno.toFixed(2) + "%",
+          liveCapital: liveCapital.toString()
+        };
+      });
 
     ranking.sort((a, b) => parseFloat(b.retorno) - parseFloat(a.retorno));
     res.json(ranking.slice(0, 10));
@@ -2746,11 +2750,13 @@ cron.schedule('0 21 * * *', async () => {
         continue;
       }
 
-      // CÁLCULO GANADORES
-      const finalRanking = entries.map(e => {
-        const retorno = ((e.virtualCapital - config.initialCapital) / config.initialCapital) * 100;
-        return { entry: e, retorno };
-      }).sort((a, b) => b.retorno - a.retorno);
+      // CÁLCULO GANADORES – solo entradas con al menos una operación realizada
+      const finalRanking = entries
+        .filter(e => e.positions.length > 0)
+        .map(e => {
+          const retorno = ((e.virtualCapital - config.initialCapital) / config.initialCapital) * 100;
+          return { entry: e, retorno };
+        }).sort((a, b) => b.retorno - a.retorno);
 
       const prizes = [0.5, 0.3, 0.2];
 
@@ -2826,7 +2832,7 @@ cron.schedule('0 21 * * *', async () => {
       const prizePool = participants * config.entryPrice - participants * config.comision;
       const prizes = [0.5, 0.3, 0.2];
 
-      const levelFinal = finalEntries.filter(e => e.level === level);
+      const levelFinal = finalEntries.filter(e => e.level === level && e.positions.length > 0);
       const ranked = levelFinal.map(e => ({
         entryId: e.id,
         nickname: e.user?.nickname || 'Anónimo',
