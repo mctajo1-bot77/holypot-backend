@@ -717,6 +717,7 @@ async function emitLiveData() {
       const liveCapitalInt = Math.floor(liveCapital);
 
       return {
+        userId: entry.userId,
         entryId: entry.id,
         liveCapital: liveCapitalInt,
         positions: entry.positions.map(p => {
@@ -748,7 +749,12 @@ async function emitLiveData() {
       };
     }));
 
-    io.emit('liveUpdate', dataToEmit);
+    // Emitir datos privados solo al room del usuario (evita exponer posiciones a otros clientes)
+    for (const item of dataToEmit) {
+      if (item.userId) {
+        io.to(item.userId).emit('liveUpdate', [item]);
+      }
+    }
   } catch (error) {
     console.error('Error emitLiveData:', error);
   }
@@ -2705,20 +2711,25 @@ cron.schedule('0 21 * * *', async () => {
       // CIERRE FORZADO POSICIONES
       for (const entry of entries) {
         const openPositions = entry.positions.filter(p => !p.closedAt);
+        let runningCapital = entry.virtualCapital;
+
         for (const p of openPositions) {
           const currentPrice = getCurrentPrice(p.symbol) || p.entryPrice;
           const sign = p.direction === 'long' ? 1 : -1;
           const pnlPercent = sign * ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
-          const pnlAmount = entry.virtualCapital * (p.lotSize || 0) * (pnlPercent / 100);
-
-          await prisma.entry.update({
-            where: { id: entry.id },
-            data: { virtualCapital: entry.virtualCapital + pnlAmount }
-          });
+          const pnlAmount = runningCapital * (p.lotSize || 0) * (pnlPercent / 100);
+          runningCapital += pnlAmount;
 
           await prisma.position.update({
             where: { id: p.id },
             data: { closedAt: new Date(), currentPnl: pnlPercent }
+          });
+        }
+
+        if (openPositions.length > 0) {
+          await prisma.entry.update({
+            where: { id: entry.id },
+            data: { virtualCapital: runningCapital }
           });
         }
       }
