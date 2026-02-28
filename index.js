@@ -1830,10 +1830,39 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
         closedAt: p.closedAt
       }));
 
+    // Calcular posición actual en ranking de su nivel
+    const levelEntries = await prisma.entry.findMany({
+      where: { level: entry.level, status: 'confirmed' },
+      include: { positions: { where: { closedAt: null } } }
+    });
+    const levelInitial = levelsConfig[entry.level].initialCapital;
+    const levelRanking = levelEntries.map(e => {
+      let cap = e.virtualCapital;
+      e.positions.forEach(p => {
+        const cp = getCurrentPrice(p.symbol);
+        if (cp && p.entryPrice && p.orderStatus !== 'pending') {
+          const sign = p.direction === 'long' ? 1 : -1;
+          cap += e.virtualCapital * (p.lotSize || 0) * sign * ((cp - p.entryPrice) / p.entryPrice);
+        }
+      });
+      return { userId: e.userId, liveCapital: cap };
+    });
+    levelRanking.sort((a, b) => b.liveCapital - a.liveCapital);
+    const currentPos = levelRanking.findIndex(r => r.userId === entry.userId) + 1;
+    const currentPosition = currentPos > 0 ? `#${currentPos}` : '#-';
+
+    // Mejor posición histórica (de todas las competencias cerradas del usuario)
+    const allClosedPayouts = await prisma.payout.findMany({
+      where: { userId: entry.userId, status: { in: ['pending', 'sent', 'confirmed'] } },
+      orderBy: { position: 'asc' }
+    });
+    const bestPos = allClosedPayouts.length > 0 ? allClosedPayouts[0].position : null;
+    const bestRanking = bestPos ? `#${bestPos}` : '#-';
+
     res.json({
       nickname: entry.user.nickname || 'Anónimo',
-      currentPosition: '#-',
-      bestRanking: '#-',
+      currentPosition,
+      bestRanking,
       stats,
       history,
       liveCapital: Math.floor(liveCapital),
@@ -1879,10 +1908,13 @@ app.get('/api/last-winners', async (req, res) => {
 
       ranking.sort((a, b) => b.retorno - a.retorno);
 
+      const prizeDistribution = [0.5, 0.3, 0.2];
+      const prizePool = entries.length * levelsConfig[level].entryPrice - entries.length * levelsConfig[level].comision;
       const top3 = ranking.slice(0, 3).map((r, i) => ({
         position: i + 1,
         nickname: r.nickname,
-        prize: 0
+        prize: parseFloat((prizePool * (prizeDistribution[i] || 0)).toFixed(2)),
+        retorno: parseFloat(r.retorno.toFixed(2))
       }));
 
       winners[level] = top3;
