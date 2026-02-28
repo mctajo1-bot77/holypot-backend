@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const { PrismaClient } = require('@prisma/client');
 const axios = require('axios');
 const http = require('http');
@@ -118,12 +119,13 @@ io.on('connection', (socket) => {
 // ==================================================
 
 app.set('trust proxy', 1);
+app.use(helmet({ contentSecurityPolicy: false })); // Security headers (CSP disabled for API)
 app.use(cookieParser());
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true
 }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 const prisma = new PrismaClient();
 
@@ -1003,14 +1005,16 @@ app.post('/api/webhook-nowpayments', express.raw({type: 'application/json'}), as
   const body = req.body.toString();
   const signature = req.headers['x-nowpayments-sig'];
   const secret = process.env.NOWPAYMENTS_SECRET;
-  if (secret) {
-    const hash = crypto.createHmac('sha512', secret)
-      .update(body)
-      .digest('hex');
-    if (hash !== signature) {
-      console.warn('Webhook HMAC inválido');
-      return res.status(401).send('Invalid signature');
-    }
+  if (!secret) {
+    console.error('NOWPAYMENTS_SECRET no configurado – rechazando webhook');
+    return res.status(500).send('Webhook not configured');
+  }
+  const hash = crypto.createHmac('sha512', secret)
+    .update(body)
+    .digest('hex');
+  if (hash !== signature) {
+    console.warn('Webhook HMAC inválido');
+    return res.status(401).send('Invalid signature');
   }
 
   try {
@@ -1042,14 +1046,16 @@ app.post('/api/webhook-payout', express.raw({type: 'application/json'}), async (
   const signature = req.headers['x-nowpayments-sig'];
   const secret = process.env.NOWPAYMENTS_SECRET;
 
-  if (secret) {
-    const hash = crypto.createHmac('sha512', secret)
-      .update(body)
-      .digest('hex');
-    if (hash !== signature) {
-      console.warn('Webhook payout HMAC invalido');
-      return res.status(401).send('Invalid signature');
-    }
+  if (!secret) {
+    console.error('NOWPAYMENTS_SECRET no configurado – rechazando webhook payout');
+    return res.status(500).send('Webhook not configured');
+  }
+  const hash = crypto.createHmac('sha512', secret)
+    .update(body)
+    .digest('hex');
+  if (hash !== signature) {
+    console.warn('Webhook payout HMAC invalido');
+    return res.status(401).send('Invalid signature');
   }
 
   try {
@@ -1273,11 +1279,9 @@ app.post('/api/create-payment', async (req, res) => {
       where: { userId: user.id, status: 'confirmed' }
     });
     if (existingConfirmed) {
-      const token2 = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
       return res.status(400).json({
         error: 'Ya tienes una competencia activa. Espera a que termine para inscribirte de nuevo.',
         code: 'ACTIVE_ENTRY_EXISTS',
-        token: token2,
         entryId: existingConfirmed.id
       });
     }
@@ -1413,6 +1417,7 @@ app.post('/api/open-trade', authenticateToken, async (req, res) => {
       include: { positions: { where: { closedAt: null } } }
     });
     if (!entry || entry.status !== "confirmed") return res.status(400).json({ error: "Entry no confirmada" });
+    if (entry.userId !== req.user.userId) return res.status(403).json({ error: "No autorizado" });
 
     const todayStart = new Date();
     todayStart.setUTCHours(0, 0, 0, 0);
@@ -1527,6 +1532,7 @@ app.post('/api/close-trade', authenticateToken, async (req, res) => {
       include: { entry: true }
     });
     if (!position || position.closedAt) return res.status(400).json({ error: "Position no abierta" });
+    if (position.entry.userId !== req.user.userId) return res.status(403).json({ error: "No autorizado" });
 
     const currentPrice = getCurrentPrice(position.symbol);
     if (!currentPrice) return res.status(400).json({ error: "Precio temporalmente no disponible para cerrar" });
@@ -1593,6 +1599,7 @@ app.post('/api/edit-position', authenticateToken, async (req, res) => {
       include: { entry: { include: { positions: true } } }
     });
     if (!position || position.closedAt) return res.status(400).json({ error: "Position no abierta" });
+    if (position.entry.userId !== req.user.userId) return res.status(403).json({ error: "No autorizado" });
 
     const currentOpenLot = position.entry.positions
       .filter(p => !p.closedAt && p.id !== positionId)
@@ -1627,6 +1634,7 @@ app.get('/api/my-positions', authenticateToken, async (req, res) => {
       include: { positions: true }
     });
     if (!entry) return res.status(404).json({ error: "Entry no encontrada" });
+    if (entry.userId !== req.user.userId) return res.status(403).json({ error: "No autorizado" });
 
     let liveCapital = entry.virtualCapital;
 
@@ -2203,9 +2211,8 @@ app.get('/api/admin/data', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Admin viejo
-app.get('/admin', async (req, res) => {
-  if (req.query.pass !== ADMIN_PASSWORD) return res.status(401).json({ error: "Password incorrecto" });
+// Admin viejo – protegido con middleware JWT admin
+app.get('/admin', authenticateAdmin, async (req, res) => {
 
   try {
     const entries = await prisma.entry.findMany({
@@ -2308,7 +2315,7 @@ app.get('/admin', async (req, res) => {
 });
 
 // Manual create + confirm
-app.post('/api/manual-create-confirm', async (req, res) => {
+app.post('/api/manual-create-confirm', authenticateAdmin, async (req, res) => {
   const { email, walletAddress, level } = req.body;
   if (!email || !walletAddress || !level) return res.status(400).json({ error: "Email, wallet and level required" });
 
