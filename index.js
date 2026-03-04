@@ -33,42 +33,60 @@ function generateVerificationToken() {
 // Función para enviar email
 async function sendVerificationEmail(email, token) {
   const verificationUrl = `${process.env.FRONTEND_URL}/verify-email?token=${token}`;
-  
+
+  // IMPORTANTE: RESEND_FROM_EMAIL debe ser un email de un dominio verificado en Resend.
+  // onboarding@resend.dev SOLO envía al email registrado en la cuenta Resend (sandbox).
+  // Para producción usa: noreply@tudominio.com (verificado en resend.com/domains)
+  const fromEmail = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+
+  if (!process.env.RESEND_API_KEY) {
+    console.error('❌ RESEND_API_KEY no configurado – email no enviado');
+    return { success: false, error: 'RESEND_API_KEY no configurado' };
+  }
+
   try {
     const { data, error } = await resend.emails.send({
-      from: 'Holypot <onboarding@resend.dev>',
+      from: `Holypot Trading <${fromEmail}>`,
       to: email,
-      subject: '🎯 Confirma tu email - Holypot',
+      subject: '✅ Confirma tu email - Holypot Trading',
       html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-          <h1 style="color: #667eea; text-align: center;">🎯 Holypot</h1>
-          <h2>¡Bienvenido!</h2>
-          <p>Confirma tu email para comenzar a competir:</p>
-          <div style="text-align: center; margin: 30px 0;">
-            <a href="${verificationUrl}" style="background: #667eea; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
-              ✅ Confirmar Email
-            </a>
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0F172A; color: #ffffff; border-radius: 12px;">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <h1 style="color: #D4AF37; font-size: 28px; margin: 0;">🏆 Holypot Trading</h1>
+            <p style="color: #9ca3af; font-size: 14px; margin: 6px 0 0;">Plataforma de Trading Competitivo</p>
           </div>
-          <p style="color: #666; font-size: 14px;">
-            O copia este enlace:<br>
-            <code>${verificationUrl}</code>
-          </p>
-          <p style="color: #999; font-size: 12px; margin-top: 30px;">
-            Este enlace expira en 24 horas.
+          <div style="background: #1E293B; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
+            <h2 style="color: #ffffff; margin: 0 0 12px;">¡Bienvenido/a!</h2>
+            <p style="color: #d1d5db; line-height: 1.6; margin: 0 0 20px;">
+              Confirma tu dirección de email para activar tu cuenta y comenzar a competir.
+            </p>
+            <div style="text-align: center;">
+              <a href="${verificationUrl}"
+                style="background: linear-gradient(135deg, #D4AF37, #FFD700); color: #000000; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 16px; display: inline-block;">
+                ✅ Confirmar Email
+              </a>
+            </div>
+          </div>
+          <div style="background: #1a1a2e; border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+            <p style="color: #9ca3af; font-size: 12px; margin: 0 0 8px;">O copia este enlace en tu navegador:</p>
+            <code style="color: #60a5fa; font-size: 11px; word-break: break-all;">${verificationUrl}</code>
+          </div>
+          <p style="color: #6b7280; font-size: 12px; text-align: center; margin: 0;">
+            Este enlace expira en 24 horas. Si no creaste esta cuenta, ignora este email.
           </p>
         </div>
       `
     });
 
     if (error) {
-      console.error('❌ Error enviando email:', error);
+      console.error('❌ Error enviando email de verificación a', email, ':', JSON.stringify(error));
       return { success: false, error };
     }
 
-    console.log('✅ Email enviado:', data);
+    console.log('✅ Email de verificación enviado a', email, '- ID:', data?.id);
     return { success: true, data };
   } catch (error) {
-    console.error('❌ Error:', error);
+    console.error('❌ Excepción enviando email:', error.message);
     return { success: false, error: error.message };
   }
 }
@@ -2176,7 +2194,7 @@ app.get('/api/admin/data', authenticateAdmin, async (req, res) => {
         level: true,
         status: true,
         virtualCapital: true,
-        user: { select: { id: true, email: true, nickname: true, walletAddress: true } },
+        user: { select: { id: true, email: true, nickname: true, walletAddress: true, emailVerified: true } },
         positions: { select: { id: true, symbol: true, direction: true, lotSize: true, entryPrice: true, closedAt: true } }
       }
     });
@@ -2244,6 +2262,8 @@ app.get('/api/admin/data', authenticateAdmin, async (req, res) => {
       return {
         id: e.id,
         displayName: e.user?.nickname || 'Anónimo',
+        email: e.user?.email || '',
+        emailVerified: e.user?.emailVerified ?? false,
         wallet: e.user?.walletAddress || '',
         level: e.level,
         status: e.status,
@@ -2523,6 +2543,29 @@ app.get('/api/candles/:symbol', async (req, res) => {
   } catch (err) {
     console.error('Error fetching candles', err);
     res.json({ candles: [] });
+  }
+});
+
+// ── VERIFICAR EMAIL MANUALMENTE (admin) – para cuando el email no llega ──
+app.post('/api/admin/verify-email-manual', authenticateAdmin, async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email requerido' });
+
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (user.emailVerified) return res.json({ success: true, message: 'Email ya estaba verificado' });
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { emailVerified: true, verificationToken: null, tokenExpiry: null }
+    });
+
+    console.log(`✅ Email verificado manualmente por admin: ${email}`);
+    res.json({ success: true, message: `Email de ${email} verificado manualmente` });
+  } catch (error) {
+    console.error('Error verificando email manual:', error);
+    res.status(500).json({ error: 'Error al verificar', details: error.message });
   }
 });
 
