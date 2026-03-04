@@ -2546,6 +2546,110 @@ app.get('/api/candles/:symbol', async (req, res) => {
   }
 });
 
+// ── LISTAR USUARIOS ESTUDIANTES (admin) ────────────────────────────────────
+app.get('/api/admin/students', authenticateAdmin, async (req, res) => {
+  try {
+    const students = await prisma.entry.findMany({
+      where: { mode: 'student' },
+      orderBy: { id: 'desc' },
+      include: {
+        user: { select: { id: true, email: true, nickname: true, country: true, emailVerified: true, createdAt: true } },
+        positions: { select: { id: true, closedAt: true, createdAt: true } }
+      }
+    });
+
+    const result = students.map(e => {
+      const openPositions  = e.positions.filter(p => !p.closedAt).length;
+      const totalPositions = e.positions.length;
+      const lastActivity   = e.positions.length > 0
+        ? e.positions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0].createdAt
+        : null;
+      return {
+        entryId:       e.id,
+        userId:        e.user?.id,
+        email:         e.user?.email || '',
+        nickname:      e.user?.nickname || 'Sin nickname',
+        country:       e.user?.country || 'OTHER',
+        emailVerified: e.user?.emailVerified ?? false,
+        joinedAt:      e.user?.createdAt,
+        level:         e.level,
+        status:        e.status,
+        virtualCapital: e.virtualCapital,
+        openPositions,
+        totalPositions,
+        lastActivity
+      };
+    });
+
+    res.json({ students: result, total: result.length });
+  } catch (error) {
+    console.error('Error /admin/students:', error);
+    res.status(500).json({ error: 'Error obteniendo estudiantes', details: error.message });
+  }
+});
+
+// ── ENVIAR EMAIL MASIVO A ESTUDIANTES (admin) ────────────────────────────
+app.post('/api/admin/send-marketing-email', authenticateAdmin, async (req, res) => {
+  const { subject, html, onlyVerified = true, previewEmail } = req.body;
+  if (!subject || !html) return res.status(400).json({ error: 'subject y html son requeridos' });
+
+  const fromEmail = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+
+  try {
+    // Si previewEmail está definido, solo enviar a ese email (prueba)
+    if (previewEmail) {
+      const { data, error } = await resend.emails.send({
+        from: `Holypot Trading <${fromEmail}>`,
+        to: previewEmail,
+        subject: `[PREVIEW] ${subject}`,
+        html
+      });
+      if (error) return res.status(500).json({ error: 'Error enviando preview', details: error });
+      return res.json({ success: true, mode: 'preview', sentTo: previewEmail, id: data?.id });
+    }
+
+    // Obtener emails únicos de usuarios estudiantes
+    const entries = await prisma.entry.findMany({
+      where: { mode: 'student', ...(onlyVerified ? { user: { emailVerified: true } } : {}) },
+      include: { user: { select: { email: true, nickname: true } } },
+      distinct: ['userId']
+    });
+
+    const recipients = [...new Map(entries.map(e => [e.user?.email, e.user])).values()]
+      .filter(u => u?.email);
+
+    if (recipients.length === 0) {
+      return res.json({ success: true, sent: 0, message: 'No hay destinatarios' });
+    }
+
+    // Enviar en lotes de 10 para no saturar la API
+    let sent = 0, failed = 0;
+    const BATCH = 10;
+    for (let i = 0; i < recipients.length; i += BATCH) {
+      const batch = recipients.slice(i, i + BATCH);
+      await Promise.all(batch.map(async (u) => {
+        const personalHtml = html.replace(/\{\{nickname\}\}/g, u.nickname || 'Trader');
+        const { error } = await resend.emails.send({
+          from: `Holypot Trading <${fromEmail}>`,
+          to: u.email,
+          subject,
+          html: personalHtml
+        });
+        if (error) { failed++; console.error(`Error enviando a ${u.email}:`, error); }
+        else sent++;
+      }));
+      // Pequeña pausa entre lotes
+      if (i + BATCH < recipients.length) await new Promise(r => setTimeout(r, 500));
+    }
+
+    console.log(`✅ Email masivo enviado: ${sent} OK, ${failed} fallidos`);
+    res.json({ success: true, sent, failed, total: recipients.length });
+  } catch (error) {
+    console.error('Error send-marketing-email:', error);
+    res.status(500).json({ error: 'Error enviando emails', details: error.message });
+  }
+});
+
 // ── VERIFICAR EMAIL MANUALMENTE (admin) – para cuando el email no llega ──
 app.post('/api/admin/verify-email-manual', authenticateAdmin, async (req, res) => {
   const { email } = req.body;
