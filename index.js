@@ -2193,6 +2193,7 @@ app.get('/api/admin/data', authenticateAdmin, async (req, res) => {
         id: true,
         level: true,
         status: true,
+        mode: true,
         virtualCapital: true,
         user: { select: { id: true, email: true, nickname: true, walletAddress: true, emailVerified: true } },
         positions: { select: { id: true, symbol: true, direction: true, lotSize: true, entryPrice: true, closedAt: true } }
@@ -2249,7 +2250,7 @@ app.get('/api/admin/data', authenticateAdmin, async (req, res) => {
       };
     }));
 
-    const usuarios = entries.map(e => {
+    const usuarios = entries.filter(e => e.mode !== 'student').map(e => {
       let liveCapital = e.virtualCapital ?? levelsConfigAdmin[e.level]?.initialCapital ?? 10000;
       (e.positions || []).filter(p => !p.closedAt).forEach(p => {
         if (!p.symbol || !p.entryPrice || p.entryPrice === 0) return;
