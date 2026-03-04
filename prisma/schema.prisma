@@ -15,11 +15,16 @@ model User {
   nickname      String?  @unique // unico
   emailVerified Boolean @default(false)
   country            String?
-  verificationToken  String?  @unique     // ← NUEVO
-  tokenExpiry        DateTime?             // ← NUEVO
+  verificationToken  String?  @unique
+  tokenExpiry        DateTime?
   entries       Entry[]
   advices       Advice[]
   payouts       Payout[]
+  surveys       StudentSurvey[]
+  forumsCreated Forum[]         @relation("ForumCreator")
+  forumComments ForumComment[]
+  forumMembers  ForumMember[]
+  forumLikes    ForumLike[]
 }
 
 model Competition {
@@ -46,6 +51,7 @@ model Entry {
   createdAt      DateTime @default(now())
   closedAt       DateTime? // fecha de cierre de la competencia (seteado por cron)
   wasRollover    Boolean  @default(false) // true si esta entrada fue una renovación por rollover
+  mode           String   @default("real") // "real" or "student"
 
   user        User         @relation(fields: [userId], references: [id])
   competition Competition? @relation(fields: [competitionId], references: [id])
@@ -126,4 +132,74 @@ model DailyCandle {
 
   @@unique([symbol, date, time]) // evita duplicados
   @@index([symbol, date])
+}
+
+model StudentSurvey {
+  id              String   @id @default(uuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  competitionDate DateTime
+  rating          Int      // 1-5
+  likes           String
+  dislikes        String
+  suggestions     String
+  bugReport       String?
+  createdAt       DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Forum {
+  id          String   @id @default(uuid())
+  title       String
+  content     String
+  imageUrls   String[]
+  creatorId   String
+  creator     User     @relation("ForumCreator", fields: [creatorId], references: [id])
+  viewCount   Int      @default(0)
+  tags        String[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  comments    ForumComment[]
+  members     ForumMember[]
+  likes       ForumLike[]
+}
+
+model ForumComment {
+  id        String   @id @default(uuid())
+  forumId   String
+  forum     Forum    @relation(fields: [forumId], references: [id])
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  content   String
+  imageUrl  String?
+  createdAt DateTime @default(now())
+  likes     ForumLike[]
+}
+
+model ForumMember {
+  id       String   @id @default(uuid())
+  forumId  String
+  forum    Forum    @relation(fields: [forumId], references: [id])
+  userId   String
+  user     User     @relation(fields: [userId], references: [id])
+  joinedAt DateTime @default(now())
+
+  @@unique([forumId, userId])
+}
+
+model ForumLike {
+  id         String        @id @default(uuid())
+  userId     String
+  user       User          @relation(fields: [userId], references: [id])
+  targetId   String        // forumId or commentId
+  targetType String        // "forum" or "comment"
+  type       String        // "like" or "dislike"
+  forumId    String?
+  forum      Forum?        @relation(fields: [forumId], references: [id])
+  commentId  String?
+  comment    ForumComment? @relation(fields: [commentId], references: [id])
+  createdAt  DateTime      @default(now())
+
+  @@unique([userId, targetId])
 }

@@ -928,24 +928,27 @@ app.post('/api/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(400).json({ error: "Password incorrect" });
 
-    // ✅ AQUÍ: Buscar la entry más reciente confirmada del usuario (DESPUÉS de obtener user)
-    const entry = await prisma.entry.findFirst({
-      where: { 
-        userId: user.id,
-        status: "confirmed"
-      },
-      orderBy: { id: 'desc' }
-    });
+    // Buscar entry real activa y entry de estudiante activa
+    const [realEntry, studentEntry] = await Promise.all([
+      prisma.entry.findFirst({
+        where: { userId: user.id, status: "confirmed", mode: "real" },
+        orderBy: { id: 'desc' }
+      }),
+      prisma.entry.findFirst({
+        where: { userId: user.id, status: "confirmed", mode: "student" },
+        orderBy: { id: 'desc' }
+      })
+    ]);
 
     const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 
     res.cookie('holypotToken', token, getCookieOptions());
 
-    // ✅ AQUÍ: Devolver también el entryId
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       token,
-      entryId: entry ? entry.id : null
+      entryId: realEntry ? realEntry.id : null,
+      studentEntryId: studentEntry ? studentEntry.id : null
     });
   } catch (error) {
     res.status(500).json({ error: "Error login", details: error.message });
@@ -1280,9 +1283,9 @@ app.post('/api/create-payment', async (req, res) => {
       });
     }
 
-    // ── Prevenir múltiples entradas activas para el mismo usuario ──────────
+    // ── Prevenir múltiples entradas REALES activas para el mismo usuario ──────────
     const existingConfirmed = await prisma.entry.findFirst({
-      where: { userId: user.id, status: 'confirmed' }
+      where: { userId: user.id, status: 'confirmed', mode: 'real' }
     });
     if (existingConfirmed) {
       return res.status(400).json({
@@ -1315,7 +1318,8 @@ app.post('/api/create-payment', async (req, res) => {
         paymentId: paymentData.id,
         paymentNetwork: selectedNetwork,
         status: "pending",
-        virtualCapital: capital
+        virtualCapital: capital,
+        mode: "real"
       }
     });
 
@@ -1801,12 +1805,12 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
     const history = allUserEntries.map(e => {
       const initialCap = levelsConfig[e.level]?.initialCapital || 10000;
       const entryReturn = ((e.virtualCapital - initialCap) / initialCap * 100).toFixed(2);
-      // Usar el payout directamente vinculado por entryId (relación directa, sin fuzzy matching)
       const matchPayout = e.payouts?.[0] || null;
-      // Mostrar la fecha de cierre de la competencia (no de creación del pago)
       const displayDate = e.closedAt
         ? new Date(e.closedAt).toLocaleDateString('es-ES')
         : new Date(e.createdAt).toLocaleDateString('es-ES');
+      // Calculate virtual prize for student entries
+      const isStudent = e.mode === 'student';
       return {
         date: displayDate,
         paymentDate: new Date(e.createdAt).toLocaleDateString('es-ES'),
@@ -1815,7 +1819,9 @@ app.get('/api/my-profile', authenticateToken, async (req, res) => {
         position: matchPayout?.position || 0,
         prize: matchPayout?.amount || 0,
         status: e.status,
-        wasRollover: e.wasRollover || false
+        wasRollover: e.wasRollover || false,
+        mode: e.mode || 'real',
+        isStudent
       };
     });
 
@@ -2685,6 +2691,488 @@ app.get('/api/admin/nowpayments-status', authenticateAdmin, async (req, res) => 
   res.json(results);
 });
 
+// ============================================================
+// STUDENT MODE ENDPOINTS
+// ============================================================
+const studentJoinLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  message: { error: 'Demasiados registros estudiante – espera 1 hora' }
+});
+
+// POST /api/student/join – crear entrada estudiante (sin pago)
+app.post('/api/student/join', studentJoinLimiter, async (req, res) => {
+  const { email, password, nickname, country, level = 'basic', hCaptchaToken } = req.body;
+
+  if (!email) return res.status(400).json({ error: 'Email requerido' });
+  if (!levelsConfig[level]) return res.status(400).json({ error: 'Nivel inválido' });
+
+  const captchaValid = await verifyHCaptcha(hCaptchaToken);
+  if (!captchaValid) return res.status(400).json({ error: 'Captcha inválido' });
+
+  const now = new Date();
+  if (now.getUTCHours() >= 18) {
+    return res.status(400).json({ error: 'Inscripciones cerradas después de las 18:00 UTC. ¡Vuelve mañana!' });
+  }
+
+  try {
+    let user = await prisma.user.findUnique({ where: { email } });
+
+    if (!user) {
+      if (!password || !nickname) {
+        return res.status(400).json({ error: 'Email, contraseña y nickname requeridos para nuevos usuarios' });
+      }
+      const hashedPassword = await bcrypt.hash(password, 10);
+      const verificationToken = generateVerificationToken();
+      const tokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      user = await prisma.user.create({
+        data: { email, password: hashedPassword, nickname, country: country || null, emailVerified: false, verificationToken, tokenExpiry }
+      });
+      await sendVerificationEmail(email, verificationToken);
+    } else {
+      if (password && user.password) {
+        const valid = await bcrypt.compare(password, user.password);
+        if (!valid) return res.status(400).json({ error: 'Contraseña incorrecta' });
+      }
+    }
+
+    // Verificar si ya tiene entrada estudiante activa
+    const existingStudent = await prisma.entry.findFirst({
+      where: { userId: user.id, status: 'confirmed', mode: 'student' }
+    });
+    if (existingStudent) {
+      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+      res.cookie('holypotToken', token, getCookieOptions());
+      return res.json({ message: 'Ya tienes entrada estudiante activa', token, studentEntryId: existingStudent.id, alreadyExists: true });
+    }
+
+    // Verificar encuesta requerida de competencia anterior
+    const lastStudentEntry = await prisma.entry.findFirst({
+      where: { userId: user.id, status: 'closed', mode: 'student' },
+      orderBy: { closedAt: 'desc' }
+    });
+    if (lastStudentEntry && lastStudentEntry.closedAt) {
+      const surveyWindow = new Date(lastStudentEntry.closedAt.getTime() - 5 * 60 * 1000);
+      const survey = await prisma.studentSurvey.findFirst({
+        where: { userId: user.id, createdAt: { gte: surveyWindow } }
+      });
+      if (!survey) {
+        return res.status(403).json({
+          error: 'Debes completar la encuesta de la competencia anterior para participar de nuevo.',
+          code: 'SURVEY_REQUIRED',
+          closedAt: lastStudentEntry.closedAt
+        });
+      }
+    }
+
+    const { initialCapital } = levelsConfig[level];
+    const entry = await prisma.entry.create({
+      data: { user: { connect: { id: user.id } }, level, status: 'confirmed', virtualCapital: initialCapital, mode: 'student' }
+    });
+
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    res.cookie('holypotToken', token, getCookieOptions());
+    res.status(201).json({ message: 'Entrada estudiante creada. ¡Bienvenido!', token, studentEntryId: entry.id, level, virtualCapital: initialCapital });
+  } catch (error) {
+    console.error('Error student/join:', error);
+    if (error.code === 'P2002') return res.status(400).json({ error: 'El nickname ya está en uso' });
+    res.status(500).json({ error: 'Error creando entrada estudiante', details: error.message });
+  }
+});
+
+// GET /api/student/competitions/active
+app.get('/api/student/competitions/active', async (req, res) => {
+  try {
+    const entries = await prisma.entry.findMany({ where: { status: 'confirmed', mode: 'student' } });
+    const now = new Date();
+    const utcNow = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds());
+    const endOfDayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 21, 0, 0);
+    const msLeft = endOfDayUTC - utcNow;
+    const hoursLeft = Math.max(0, Math.floor(msLeft / (1000 * 60 * 60)));
+    const minutesLeft = Math.max(0, Math.floor((msLeft % (1000 * 60 * 60)) / (1000 * 60)));
+
+    const competitions = Object.entries(levelsConfig).map(([level, config]) => {
+      const levelEntries = entries.filter(e => e.level === level);
+      const participants = levelEntries.length;
+      const virtualPool = participants * 10;
+      const realEquivalentPool = participants * config.entryPrice - participants * config.comision;
+      return {
+        level, name: config.name, entryPrice: config.entryPrice, initialCapital: config.initialCapital,
+        participants, virtualPool, realEquivalentPool: parseFloat(realEquivalentPool.toFixed(2)),
+        timeLeft: `${hoursLeft}h ${minutesLeft}m`, isStudent: true
+      };
+    });
+    res.json(competitions);
+  } catch (error) {
+    res.status(500).json({ error: 'Error cargando competencias estudiante' });
+  }
+});
+
+// GET /api/student/ranking
+app.get('/api/student/ranking', async (req, res) => {
+  const { level = 'basic' } = req.query;
+  try {
+    const entries = await prisma.entry.findMany({
+      where: { level, status: 'confirmed', mode: 'student' },
+      include: { user: { select: { nickname: true, country: true } }, positions: { where: { closedAt: null } } }
+    });
+    const initial = levelsConfig[level]?.initialCapital || 10000;
+    const ranking = entries.map(e => {
+      let liveCapital = e.virtualCapital;
+      e.positions.filter(p => p.orderStatus !== 'pending').forEach(p => {
+        const currentPrice = getCurrentPrice(p.symbol);
+        if (currentPrice && p.entryPrice) {
+          const sign = p.direction === 'long' ? 1 : -1;
+          liveCapital += e.virtualCapital * (p.lotSize || 0) * sign * ((currentPrice - p.entryPrice) / p.entryPrice);
+        }
+      });
+      return {
+        entryId: e.id, nickname: e.user?.nickname || 'Anónimo', country: e.user?.country || 'OTHER',
+        liveCapital: Math.floor(liveCapital), retorno: parseFloat(((liveCapital - initial) / initial * 100).toFixed(2))
+      };
+    }).sort((a, b) => b.retorno - a.retorno).map((r, i) => ({ ...r, position: i + 1 }));
+    res.json(ranking);
+  } catch (error) {
+    res.status(500).json({ error: 'Error cargando ranking estudiante' });
+  }
+});
+
+// GET /api/student/last-winners
+app.get('/api/student/last-winners', async (req, res) => {
+  try {
+    const winners = {};
+    for (const level of Object.keys(levelsConfig)) {
+      const entries = await prisma.entry.findMany({
+        where: { level, status: 'confirmed', mode: 'student' },
+        include: { user: true, positions: true }
+      });
+      const initial = levelsConfig[level].initialCapital;
+      const participants = entries.length;
+      const realEquivalentPool = participants * levelsConfig[level].entryPrice - participants * levelsConfig[level].comision;
+      const virtualPool = participants * 10;
+      const ranking = entries.filter(e => e.positions.length > 0).map(e => {
+        let liveCapital = e.virtualCapital;
+        e.positions.filter(p => !p.closedAt).forEach(p => {
+          const cp = getCurrentPrice(p.symbol);
+          if (cp && p.entryPrice) {
+            const sign = p.direction === 'long' ? 1 : -1;
+            liveCapital += e.virtualCapital * (p.lotSize || 0) * sign * ((cp - p.entryPrice) / p.entryPrice);
+          }
+        });
+        return { nickname: e.user.nickname || 'Anónimo', retorno: parseFloat(((liveCapital - initial) / initial * 100).toFixed(2)) };
+      }).sort((a, b) => b.retorno - a.retorno);
+      const prizeDistrib = [0.5, 0.3, 0.2];
+      winners[level] = {
+        top3: ranking.slice(0, 3).map((r, i) => ({
+          position: i + 1, nickname: r.nickname, retorno: r.retorno,
+          realEquivalentPrize: parseFloat((realEquivalentPool * (prizeDistrib[i] || 0)).toFixed(2)),
+          virtualPrize: parseFloat((virtualPool * (prizeDistrib[i] || 0)).toFixed(2))
+        })),
+        participants, realEquivalentPool: parseFloat(realEquivalentPool.toFixed(2)), virtualPool
+      };
+    }
+    res.json(winners);
+  } catch (error) {
+    res.status(500).json({ error: 'Error cargando ganadores estudiante' });
+  }
+});
+
+// GET /api/student/last-competition-results
+app.get('/api/student/last-competition-results', async (req, res) => {
+  try {
+    const results = {};
+    for (const level of Object.keys(levelsConfig)) {
+      const config = levelsConfig[level];
+      const lastClosed = await prisma.entry.findFirst({
+        where: { level, status: 'closed', mode: 'student', closedAt: { not: null } },
+        orderBy: { closedAt: 'desc' }
+      });
+      if (!lastClosed) { results[level] = { hasData: false }; continue; }
+      const closedAt = new Date(lastClosed.closedAt);
+      const from = new Date(closedAt.getTime() - 5 * 60 * 1000);
+      const to = new Date(closedAt.getTime() + 5 * 60 * 1000);
+      const entries = await prisma.entry.findMany({
+        where: { level, status: 'closed', mode: 'student', closedAt: { gte: from, lte: to } },
+        include: { user: { select: { nickname: true, country: true } } }
+      });
+      const initial = config.initialCapital;
+      const participants = entries.length;
+      const realEquivalentPool = participants * config.entryPrice - participants * config.comision;
+      const virtualPool = participants * 10;
+      const prizes = [0.5, 0.3, 0.2];
+      const ranked = entries.map(e => ({
+        nickname: e.user?.nickname || 'Anónimo', country: e.user?.country || 'OTHER',
+        retorno: parseFloat(((e.virtualCapital - initial) / initial * 100).toFixed(2))
+      })).sort((a, b) => b.retorno - a.retorno).map((r, i) => ({
+        ...r, position: i + 1,
+        realEquivalentPrize: i < 3 ? parseFloat((realEquivalentPool * prizes[i]).toFixed(2)) : 0
+      }));
+      results[level] = {
+        hasData: true, date: closedAt.toLocaleDateString('es-ES'), participants,
+        realEquivalentPool: parseFloat(realEquivalentPool.toFixed(2)), virtualPool,
+        ranking: ranked.slice(0, 10), top3: ranked.slice(0, 3)
+      };
+    }
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: 'Error cargando resultados estudiante' });
+  }
+});
+
+// POST /api/student/survey
+app.post('/api/student/survey', authenticateToken, async (req, res) => {
+  const { rating, likes, dislikes, suggestions, bugReport } = req.body;
+  if (!rating || !likes || !dislikes || !suggestions) return res.status(400).json({ error: 'rating, likes, dislikes y suggestions son requeridos' });
+  if (rating < 1 || rating > 5) return res.status(400).json({ error: 'rating debe ser entre 1 y 5' });
+  try {
+    const survey = await prisma.studentSurvey.create({
+      data: {
+        userId: req.user.userId, competitionDate: new Date(), rating: parseInt(rating),
+        likes, dislikes, suggestions, bugReport: bugReport || null
+      }
+    });
+    res.json({ success: true, surveyId: survey.id, message: '¡Gracias por tu feedback! Ya puedes participar de nuevo.' });
+  } catch (error) {
+    res.status(500).json({ error: 'Error enviando encuesta' });
+  }
+});
+
+// GET /api/student/survey-status
+app.get('/api/student/survey-status', authenticateToken, async (req, res) => {
+  try {
+    const lastStudentEntry = await prisma.entry.findFirst({
+      where: { userId: req.user.userId, status: 'closed', mode: 'student' },
+      orderBy: { closedAt: 'desc' }
+    });
+    if (!lastStudentEntry) return res.json({ needsSurvey: false });
+    const surveyWindow = new Date(lastStudentEntry.closedAt.getTime() - 5 * 60 * 1000);
+    const survey = await prisma.studentSurvey.findFirst({
+      where: { userId: req.user.userId, createdAt: { gte: surveyWindow } }
+    });
+    res.json({ needsSurvey: !survey, lastCompetitionDate: lastStudentEntry.closedAt });
+  } catch (error) {
+    res.status(500).json({ error: 'Error verificando estado de encuesta' });
+  }
+});
+
+// ============================================================
+// FORUM ENDPOINTS
+// ============================================================
+const forumLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: 'Demasiadas peticiones al foro' } });
+app.use('/api/forum', forumLimiter);
+
+// GET /api/forum – listar foros
+app.get('/api/forum', async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = 20;
+  const skip = (page - 1) * limit;
+  const search = req.query.search || '';
+  const tag = req.query.tag || '';
+  try {
+    const where = {};
+    if (search) where.title = { contains: search, mode: 'insensitive' };
+    if (tag) where.tags = { has: tag };
+    const [forums, total] = await Promise.all([
+      prisma.forum.findMany({
+        where, include: { creator: { select: { nickname: true, country: true } }, _count: { select: { comments: true, members: true, likes: true } } },
+        orderBy: { createdAt: 'desc' }, skip, take: limit
+      }),
+      prisma.forum.count({ where })
+    ]);
+    res.json({
+      forums: forums.map(f => ({
+        id: f.id, title: f.title, content: f.content.length > 200 ? f.content.slice(0, 200) + '...' : f.content,
+        imageUrls: f.imageUrls, tags: f.tags, creator: f.creator?.nickname || 'Anónimo',
+        viewCount: f.viewCount, commentCount: f._count.comments, memberCount: f._count.members,
+        likeCount: f._count.likes, createdAt: f.createdAt
+      })),
+      total, page, pages: Math.ceil(total / limit)
+    });
+  } catch (error) {
+    console.error('Error listing forums:', error);
+    res.status(500).json({ error: 'Error cargando foros' });
+  }
+});
+
+// POST /api/forum – crear foro
+app.post('/api/forum', authenticateToken, async (req, res) => {
+  const { title, content, tags = [], imageUrls = [] } = req.body;
+  if (!title || !content) return res.status(400).json({ error: 'Título y contenido requeridos' });
+  if (title.length > 200) return res.status(400).json({ error: 'Título muy largo (máx 200 caracteres)' });
+  if (content.length > 5000) return res.status(400).json({ error: 'Contenido muy largo (máx 5000 caracteres)' });
+  const prohibited = ['binance.com', 'bybit.com', 'okx.com', 'kucoin.com', 'coinbase.com', 'bitmex.com'];
+  for (const kw of prohibited) {
+    if (content.toLowerCase().includes(kw) || title.toLowerCase().includes(kw)) {
+      return res.status(400).json({ error: 'No se permite publicidad de otras plataformas de trading' });
+    }
+  }
+  try {
+    const forum = await prisma.forum.create({
+      data: {
+        title, content, tags: Array.isArray(tags) ? tags.slice(0, 5) : [],
+        imageUrls: Array.isArray(imageUrls) ? imageUrls.slice(0, 5) : [],
+        creator: { connect: { id: req.user.userId } }
+      },
+      include: { creator: { select: { nickname: true } } }
+    });
+    await prisma.forumMember.create({ data: { forumId: forum.id, userId: req.user.userId } });
+    res.status(201).json({ success: true, forum: { id: forum.id, title: forum.title, content: forum.content, tags: forum.tags, creator: forum.creator?.nickname, createdAt: forum.createdAt } });
+  } catch (error) {
+    console.error('Error creating forum:', error);
+    res.status(500).json({ error: 'Error creando foro' });
+  }
+});
+
+// GET /api/forum/:id – detalle del foro
+app.get('/api/forum/:id', async (req, res) => {
+  const { id } = req.params;
+  const token = getToken(req);
+  let userId = null;
+  if (token) { try { const d = jwt.verify(token, JWT_SECRET); userId = d.userId; } catch (e) {} }
+  try {
+    const forum = await prisma.forum.findUnique({
+      where: { id },
+      include: {
+        creator: { select: { id: true, nickname: true, country: true } },
+        comments: { include: { user: { select: { nickname: true, country: true } }, likes: true }, orderBy: { createdAt: 'asc' } },
+        members: { select: { userId: true, user: { select: { nickname: true } } } },
+        likes: true,
+        _count: { select: { members: true, comments: true } }
+      }
+    });
+    if (!forum) return res.status(404).json({ error: 'Foro no encontrado' });
+    await prisma.forum.update({ where: { id }, data: { viewCount: { increment: 1 } } });
+    const userLike = userId ? forum.likes.find(l => l.userId === userId) : null;
+    const isMember = userId ? forum.members.some(m => m.userId === userId) : false;
+    res.json({
+      id: forum.id, title: forum.title, content: forum.content, imageUrls: forum.imageUrls, tags: forum.tags,
+      creator: { nickname: forum.creator?.nickname, country: forum.creator?.country },
+      isCreator: userId ? forum.creatorId === userId : false,
+      viewCount: forum.viewCount + 1, memberCount: forum._count.members, commentCount: forum._count.comments,
+      likeCount: forum.likes.filter(l => l.type === 'like').length,
+      dislikeCount: forum.likes.filter(l => l.type === 'dislike').length,
+      userLike: userLike?.type || null, isMember, createdAt: forum.createdAt,
+      comments: forum.comments.map(c => ({
+        id: c.id, content: c.content, imageUrl: c.imageUrl,
+        author: c.user?.nickname || 'Anónimo', country: c.user?.country || 'OTHER',
+        likeCount: c.likes.filter(l => l.type === 'like').length,
+        dislikeCount: c.likes.filter(l => l.type === 'dislike').length,
+        userLike: userId ? c.likes.find(l => l.userId === userId)?.type || null : null,
+        createdAt: c.createdAt
+      }))
+    });
+  } catch (error) {
+    console.error('Error getting forum:', error);
+    res.status(500).json({ error: 'Error cargando foro' });
+  }
+});
+
+// POST /api/forum/:id/comment
+app.post('/api/forum/:id/comment', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { content, imageUrl } = req.body;
+  if (!content || !content.trim()) return res.status(400).json({ error: 'Contenido del comentario requerido' });
+  if (content.length > 2000) return res.status(400).json({ error: 'Comentario muy largo (máx 2000 caracteres)' });
+  const prohibited = ['binance.com', 'bybit.com', 'okx.com', 'kucoin.com', 'coinbase.com'];
+  for (const kw of prohibited) {
+    if (content.toLowerCase().includes(kw)) return res.status(400).json({ error: 'No se permite publicidad de otras plataformas' });
+  }
+  try {
+    const forum = await prisma.forum.findUnique({ where: { id } });
+    if (!forum) return res.status(404).json({ error: 'Foro no encontrado' });
+    const comment = await prisma.forumComment.create({
+      data: { forumId: id, userId: req.user.userId, content: content.trim(), imageUrl: imageUrl || null },
+      include: { user: { select: { nickname: true, country: true } } }
+    });
+    await prisma.forumMember.upsert({
+      where: { forumId_userId: { forumId: id, userId: req.user.userId } },
+      create: { forumId: id, userId: req.user.userId },
+      update: {}
+    });
+    res.status(201).json({
+      success: true,
+      comment: {
+        id: comment.id, content: comment.content, imageUrl: comment.imageUrl,
+        author: comment.user?.nickname || 'Anónimo', country: comment.user?.country || 'OTHER',
+        likeCount: 0, dislikeCount: 0, userLike: null, createdAt: comment.createdAt
+      }
+    });
+  } catch (error) {
+    console.error('Error adding comment:', error);
+    res.status(500).json({ error: 'Error añadiendo comentario' });
+  }
+});
+
+// POST /api/forum/:id/like
+app.post('/api/forum/:id/like', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { type } = req.body;
+  if (!['like', 'dislike'].includes(type)) return res.status(400).json({ error: 'type debe ser "like" o "dislike"' });
+  try {
+    const forum = await prisma.forum.findUnique({ where: { id } });
+    if (!forum) return res.status(404).json({ error: 'Foro no encontrado' });
+    const existing = await prisma.forumLike.findUnique({ where: { userId_targetId: { userId: req.user.userId, targetId: id } } });
+    if (existing) {
+      if (existing.type === type) {
+        await prisma.forumLike.delete({ where: { id: existing.id } });
+        return res.json({ success: true, action: 'removed', type: null });
+      }
+      await prisma.forumLike.update({ where: { id: existing.id }, data: { type } });
+      return res.json({ success: true, action: 'changed', type });
+    }
+    await prisma.forumLike.create({ data: { userId: req.user.userId, targetId: id, targetType: 'forum', type, forumId: id } });
+    res.json({ success: true, action: 'added', type });
+  } catch (error) {
+    console.error('Error liking forum:', error);
+    res.status(500).json({ error: 'Error procesando like' });
+  }
+});
+
+// POST /api/forum/comment/:commentId/like
+app.post('/api/forum/comment/:commentId/like', authenticateToken, async (req, res) => {
+  const { commentId } = req.params;
+  const { type } = req.body;
+  if (!['like', 'dislike'].includes(type)) return res.status(400).json({ error: 'type debe ser "like" o "dislike"' });
+  try {
+    const comment = await prisma.forumComment.findUnique({ where: { id: commentId } });
+    if (!comment) return res.status(404).json({ error: 'Comentario no encontrado' });
+    const existing = await prisma.forumLike.findUnique({ where: { userId_targetId: { userId: req.user.userId, targetId: commentId } } });
+    if (existing) {
+      if (existing.type === type) {
+        await prisma.forumLike.delete({ where: { id: existing.id } });
+        return res.json({ success: true, action: 'removed', type: null });
+      }
+      await prisma.forumLike.update({ where: { id: existing.id }, data: { type } });
+      return res.json({ success: true, action: 'changed', type });
+    }
+    await prisma.forumLike.create({ data: { userId: req.user.userId, targetId: commentId, targetType: 'comment', type, commentId } });
+    res.json({ success: true, action: 'added', type });
+  } catch (error) {
+    console.error('Error liking comment:', error);
+    res.status(500).json({ error: 'Error procesando like en comentario' });
+  }
+});
+
+// POST /api/forum/:id/join
+app.post('/api/forum/:id/join', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const forum = await prisma.forum.findUnique({ where: { id } });
+    if (!forum) return res.status(404).json({ error: 'Foro no encontrado' });
+    const existing = await prisma.forumMember.findUnique({ where: { forumId_userId: { forumId: id, userId: req.user.userId } } });
+    if (existing) {
+      if (forum.creatorId === req.user.userId) return res.status(400).json({ error: 'El creador no puede abandonar el foro' });
+      await prisma.forumMember.delete({ where: { id: existing.id } });
+      return res.json({ success: true, action: 'left' });
+    }
+    await prisma.forumMember.create({ data: { forumId: id, userId: req.user.userId } });
+    res.json({ success: true, action: 'joined' });
+  } catch (error) {
+    console.error('Error joining forum:', error);
+    res.status(500).json({ error: 'Error procesando unión al foro' });
+  }
+});
+
 app.get('/', (req, res) => res.json({ message: 'Holypot Trading corriendo! 🚀' }));
 
 const PORT = process.env.PORT || 5000;
@@ -2695,10 +3183,14 @@ cron.schedule('0 21 * * *', async () => {
   console.log('🔥 CRON 21:00 UTC – Cierre competencia diaria + PAGOS AUTOMÁTICOS + rollover + consejos IA + limpieza velas');
 
   try {
-    const entriesToday = await prisma.entry.findMany({
+    const allConfirmed = await prisma.entry.findMany({
       where: { status: 'confirmed' },
       include: { user: true, positions: true }
     });
+
+    // Separate real and student entries
+    const entriesToday = allConfirmed.filter(e => e.mode !== 'student');
+    const studentEntriesToday = allConfirmed.filter(e => e.mode === 'student');
 
     const byLevel = {};
     Object.keys(levelsConfig).forEach(level => {
@@ -2855,11 +3347,100 @@ cron.schedule('0 21 * * *', async () => {
     io.emit('competitionEnded', competitionResults);
     console.log('📣 Evento competitionEnded emitido a todos los clientes');
 
-    // GENERACIÓN CONSEJOS IA (con Promise.allSettled para que un error no bloquee el cron)
+    // ── CIERRE COMPETENCIAS ESTUDIANTE ────────────────────────────────────
+    if (studentEntriesToday.length > 0) {
+      const studentByLevel = {};
+      Object.keys(levelsConfig).forEach(level => {
+        studentByLevel[level] = studentEntriesToday.filter(e => e.level === level);
+      });
+
+      for (const [level, sEntries] of Object.entries(studentByLevel)) {
+        if (sEntries.length === 0) continue;
+        const config = levelsConfig[level];
+        const participants = sEntries.length;
+
+        // Cerrar posiciones abiertas
+        for (const entry of sEntries) {
+          const openPositions = entry.positions.filter(p => !p.closedAt);
+          let runningCapital = entry.virtualCapital;
+          for (const p of openPositions) {
+            const currentPrice = getCurrentPrice(p.symbol) || p.entryPrice;
+            const sign = p.direction === 'long' ? 1 : -1;
+            const pnlPercent = sign * ((currentPrice - p.entryPrice) / p.entryPrice) * 100;
+            const pnlAmount = runningCapital * (p.lotSize || 0) * (pnlPercent / 100);
+            runningCapital += pnlAmount;
+            await prisma.position.update({
+              where: { id: p.id },
+              data: { closedAt: new Date(), currentPnl: pnlPercent }
+            });
+          }
+          if (openPositions.length > 0) {
+            await prisma.entry.update({ where: { id: entry.id }, data: { virtualCapital: runningCapital } });
+          }
+        }
+
+        // Calcular ranking estudiante
+        const realEquivalentPool = participants * config.entryPrice - participants * config.comision;
+        const virtualPool = participants * 10;
+        const prizes = [0.5, 0.3, 0.2];
+
+        const studentRanking = sEntries
+          .filter(e => e.positions.length > 0)
+          .map(e => {
+            const retorno = ((e.virtualCapital - config.initialCapital) / config.initialCapital) * 100;
+            return { entry: e, retorno };
+          })
+          .sort((a, b) => b.retorno - a.retorno);
+
+        // Marcar entradas cerradas
+        await prisma.entry.updateMany({
+          where: { id: { in: sEntries.map(e => e.id) } },
+          data: { status: 'closed', closedAt: new Date() }
+        });
+
+        // Emitir resultados a cada estudiante
+        const studentResults = {
+          level,
+          rollover: false,
+          participants,
+          realEquivalentPool: parseFloat(realEquivalentPool.toFixed(2)),
+          virtualPool,
+          top3: studentRanking.slice(0, 3).map((r, i) => ({
+            position: i + 1,
+            nickname: r.entry.user?.nickname || 'Anónimo',
+            retorno: parseFloat(r.retorno.toFixed(2)),
+            realEquivalentPrize: parseFloat((realEquivalentPool * prizes[i]).toFixed(2)),
+            virtualPrize: parseFloat((virtualPool * prizes[i]).toFixed(2))
+          })),
+          ranking: studentRanking.slice(0, 10).map((r, i) => ({
+            position: i + 1,
+            nickname: r.entry.user?.nickname || 'Anónimo',
+            retorno: parseFloat(r.retorno.toFixed(2))
+          }))
+        };
+
+        // Emitir a cada estudiante en su sala personal
+        for (const entry of sEntries) {
+          const userRankPos = studentRanking.findIndex(r => r.entry.id === entry.id) + 1;
+          io.to(entry.userId).emit('studentCompetitionEnded', {
+            ...studentResults,
+            myPosition: userRankPos > 0 ? userRankPos : null,
+            myRetorno: ((entry.virtualCapital - config.initialCapital) / config.initialCapital * 100).toFixed(2)
+          });
+        }
+
+        console.log(`📚 Competencia ESTUDIANTE ${level.toUpperCase()} cerrada: ${participants} participantes`);
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────
+
+    // GENERACIÓN CONSEJOS IA – incluye real + estudiante
+    const allEntriesForAdvice = [...finalEntries, ...studentEntriesToday.filter(e => e.positions && e.positions.length > 0)];
+
     if (!process.env.GROK_API_KEY) {
       console.warn('⚠️ GROK_API_KEY no definida – consejo IA omitido');
     } else {
-      await Promise.allSettled(finalEntries.map(async (entry) => {
+      await Promise.allSettled(allEntriesForAdvice.map(async (entry) => {
         const symbolCount = {};
         entry.positions.forEach(p => {
           symbolCount[p.symbol] = (symbolCount[p.symbol] || 0) + 1;
