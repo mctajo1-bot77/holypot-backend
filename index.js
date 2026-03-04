@@ -928,6 +928,15 @@ app.post('/api/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(400).json({ error: "Password incorrect" });
 
+    // Verificar email antes de permitir login
+    if (!user.emailVerified) {
+      return res.status(403).json({
+        error: 'Debes verificar tu email antes de iniciar sesión. Revisa tu bandeja de entrada.',
+        code: 'EMAIL_NOT_VERIFIED',
+        email: user.email
+      });
+    }
+
     // Buscar entry real activa y entry de estudiante activa
     const [realEntry, studentEntry] = await Promise.all([
       prisma.entry.findFirst({
@@ -2517,6 +2526,37 @@ app.get('/api/candles/:symbol', async (req, res) => {
   }
 });
 
+// ── ELIMINAR USUARIO (admin) – para borrar cuentas de prueba ────────
+app.delete('/api/admin/user', authenticateAdmin, async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email requerido' });
+
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    // Borrar en orden: surveys, posiciones, payouts, entries, user
+    const entries = await prisma.entry.findMany({ where: { userId: user.id }, select: { id: true } });
+    const entryIds = entries.map(e => e.id);
+
+    await prisma.studentSurvey.deleteMany({ where: { userId: user.id } });
+    await prisma.advice.deleteMany({ where: { userId: user.id } });
+    await prisma.position.deleteMany({ where: { entryId: { in: entryIds } } });
+    await prisma.payout.deleteMany({ where: { userId: user.id } });
+    await prisma.forumLike.deleteMany({ where: { userId: user.id } });
+    await prisma.forumComment.deleteMany({ where: { userId: user.id } });
+    await prisma.forumMember.deleteMany({ where: { userId: user.id } });
+    await prisma.entry.deleteMany({ where: { userId: user.id } });
+    await prisma.user.delete({ where: { id: user.id } });
+
+    console.log(`✅ Usuario eliminado: ${email}`);
+    res.json({ success: true, message: `Usuario ${email} eliminado correctamente` });
+  } catch (error) {
+    console.error('Error eliminando usuario:', error);
+    res.status(500).json({ error: 'Error eliminando usuario', details: error.message });
+  }
+});
+
 // ── DIAGNOSTICO NOWPayments (admin) ──────────────────────────────
 app.get('/api/admin/nowpayments-status', authenticateAdmin, async (req, res) => {
   const results = { timestamp: new Date().toISOString(), api: {}, balance: {}, competitions: {}, entries: {}, payouts: {}, discrepancies: [] };
@@ -2728,11 +2768,25 @@ app.post('/api/student/join', studentJoinLimiter, async (req, res) => {
       user = await prisma.user.create({
         data: { email, password: hashedPassword, nickname, country: country || null, emailVerified: false, verificationToken, tokenExpiry }
       });
-      await sendVerificationEmail(email, verificationToken);
+      const emailResult = await sendVerificationEmail(email, verificationToken);
+      // Nuevo usuario: NO crear entry hasta verificar email
+      return res.status(201).json({
+        message: 'Cuenta creada. Verifica tu email para continuar.',
+        requireEmailVerification: true,
+        emailSent: emailResult.success
+      });
     } else {
       if (password && user.password) {
         const valid = await bcrypt.compare(password, user.password);
         if (!valid) return res.status(400).json({ error: 'Contraseña incorrecta' });
+      }
+      // Usuario existente: verificar que tenga email verificado
+      if (!user.emailVerified) {
+        return res.status(403).json({
+          error: 'Debes verificar tu email antes de unirte. Revisa tu bandeja de entrada.',
+          code: 'EMAIL_NOT_VERIFIED',
+          email: user.email
+        });
       }
     }
 
