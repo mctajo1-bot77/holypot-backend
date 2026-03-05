@@ -90,6 +90,50 @@ async function sendVerificationEmail(email, token) {
     return { success: false, error: error.message };
   }
 }
+
+async function sendPasswordResetEmail(email, code) {
+  const fromEmail = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+  if (!process.env.RESEND_API_KEY) {
+    console.error('❌ RESEND_API_KEY no configurado');
+    return { success: false };
+  }
+  try {
+    const { data, error } = await resend.emails.send({
+      from: `Holypot Trading <${fromEmail}>`,
+      to: email,
+      subject: '🔐 Código de recuperación - Holypot Trading',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #0F172A; color: #ffffff; border-radius: 12px;">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <h1 style="color: #D4AF37; font-size: 28px; margin: 0;">🏆 Holypot Trading</h1>
+            <p style="color: #9ca3af; font-size: 14px; margin: 6px 0 0;">Recuperación de contraseña</p>
+          </div>
+          <div style="background: #1E293B; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
+            <h2 style="color: #ffffff; margin: 0 0 12px;">Tu código de verificación</h2>
+            <p style="color: #d1d5db; line-height: 1.6; margin: 0 0 20px;">
+              Usa este código para restablecer tu contraseña. Expira en <strong>15 minutos</strong>.
+            </p>
+            <div style="text-align: center; background: #0F172A; border-radius: 8px; padding: 20px; letter-spacing: 8px;">
+              <span style="color: #D4AF37; font-size: 36px; font-weight: bold;">${code}</span>
+            </div>
+          </div>
+          <p style="color: #6b7280; font-size: 12px; text-align: center; margin: 0;">
+            Si no solicitaste este código, ignora este email. Tu contraseña no cambiará.
+          </p>
+        </div>
+      `
+    });
+    if (error) {
+      console.error('❌ Error enviando email de recuperación:', JSON.stringify(error));
+      return { success: false, error };
+    }
+    console.log('✅ Email de recuperación enviado a', email);
+    return { success: true, data };
+  } catch (error) {
+    console.error('❌ Excepción enviando email de recuperación:', error.message);
+    return { success: false, error: error.message };
+  }
+}
 // =============================================
 
 const app = express();
@@ -922,6 +966,69 @@ app.post('/api/resend-verification', async (req, res) => {
   } catch (error) {
     console.error('Error reenviando:', error);
     res.status(500).json({ error: 'Error' });
+  }
+});
+
+// POST /api/forgot-password – genera código de 6 dígitos y envía email
+app.post('/api/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email requerido' });
+
+    const user = await prisma.user.findUnique({ where: { email } });
+
+    // Siempre responder OK para no revelar si el email existe
+    if (!user || !user.password) {
+      return res.json({ success: true });
+    }
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiry = new Date(Date.now() + 15 * 60 * 1000); // 15 min
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { resetPasswordCode: code, resetPasswordExpiry: expiry }
+    });
+
+    await sendPasswordResetEmail(email, code);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error forgot-password:', error);
+    res.status(500).json({ error: 'Error enviando código' });
+  }
+});
+
+// POST /api/reset-password – verifica código y actualiza contraseña
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: 'Email, código y nueva contraseña requeridos' });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'La contraseña debe tener mínimo 8 caracteres' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (
+      !user ||
+      user.resetPasswordCode !== code ||
+      !user.resetPasswordExpiry ||
+      new Date() > user.resetPasswordExpiry
+    ) {
+      return res.status(400).json({ error: 'Código inválido o expirado' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { password: hashedPassword, resetPasswordCode: null, resetPasswordExpiry: null }
+    });
+
+    res.json({ success: true, message: 'Contraseña actualizada correctamente' });
+  } catch (error) {
+    console.error('Error reset-password:', error);
+    res.status(500).json({ error: 'Error actualizando contraseña' });
   }
 });
 
@@ -2193,6 +2300,7 @@ app.get('/api/admin/data', authenticateAdmin, async (req, res) => {
         id: true,
         level: true,
         status: true,
+        mode: true,
         virtualCapital: true,
         user: { select: { id: true, email: true, nickname: true, walletAddress: true, emailVerified: true } },
         positions: { select: { id: true, symbol: true, direction: true, lotSize: true, entryPrice: true, closedAt: true } }
@@ -2249,7 +2357,7 @@ app.get('/api/admin/data', authenticateAdmin, async (req, res) => {
       };
     }));
 
-    const usuarios = entries.map(e => {
+    const usuarios = entries.filter(e => e.mode !== 'student').map(e => {
       let liveCapital = e.virtualCapital ?? levelsConfigAdmin[e.level]?.initialCapital ?? 10000;
       (e.positions || []).filter(p => !p.closedAt).forEach(p => {
         if (!p.symbol || !p.entryPrice || p.entryPrice === 0) return;

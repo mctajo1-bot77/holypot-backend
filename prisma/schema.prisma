@@ -15,8 +15,10 @@ model User {
   nickname      String?  @unique // unico
   emailVerified Boolean @default(false)
   country            String?
-  verificationToken  String?  @unique
-  tokenExpiry        DateTime?
+  verificationToken    String?  @unique
+  tokenExpiry          DateTime?
+  resetPasswordCode    String?
+  resetPasswordExpiry  DateTime?
   entries       Entry[]
   advices       Advice[]
   payouts       Payout[]
