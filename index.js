@@ -953,10 +953,12 @@ app.post('/api/resend-verification', async (req, res) => {
       data: { verificationToken, tokenExpiry }
     });
 
+    console.log('📧 Reenviando verificación a', email);
     const emailResult = await sendVerificationEmail(email, verificationToken);
+    console.log('📧 Resultado reenvío:', JSON.stringify(emailResult));
 
     if (!emailResult.success) {
-      return res.status(500).json({ error: 'Error enviando email' });
+      return res.status(500).json({ error: 'Error enviando email', detail: emailResult.error });
     }
 
     res.json({
@@ -1022,7 +1024,7 @@ app.post('/api/reset-password', async (req, res) => {
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     await prisma.user.update({
       where: { id: user.id },
-      data: { password: hashedPassword, resetPasswordCode: null, resetPasswordExpiry: null }
+      data: { password: hashedPassword, resetPasswordCode: null, resetPasswordExpiry: null, emailVerified: true }
     });
 
     res.json({ success: true, message: 'Contraseña actualizada correctamente' });
@@ -3023,7 +3025,9 @@ app.post('/api/student/join', studentJoinLimiter, async (req, res) => {
       user = await prisma.user.create({
         data: { email, password: hashedPassword, nickname, country: country || null, emailVerified: false, verificationToken, tokenExpiry }
       });
+      console.log('📧 Enviando email de verificación a', email, '- FRONTEND_URL:', process.env.FRONTEND_URL, '- RESEND_FROM_EMAIL:', process.env.RESEND_FROM_EMAIL);
       const emailResult = await sendVerificationEmail(email, verificationToken);
+      console.log('📧 Resultado email verificación:', JSON.stringify(emailResult));
       // Nuevo usuario: NO crear entry hasta verificar email
       return res.status(201).json({
         message: 'Cuenta creada. Verifica tu email para continuar.',
