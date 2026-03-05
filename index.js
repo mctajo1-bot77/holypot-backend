@@ -1385,7 +1385,10 @@ app.post('/api/create-payment', async (req, res) => {
 
   const now = new Date();
   const utcHour = now.getUTCHours();
-  if (utcHour >= 18) {
+  const utcDay = now.getUTCDay(); // 0=domingo, 6=sábado
+  const isWeekend = utcDay === 0 || utcDay === 6;
+  // Fines de semana: inscripción todo el día. Días de semana: cerrado después de las 18:00 UTC
+  if (!isWeekend && utcHour >= 18) {
     return res.status(400).json({ error: 'Inscripciones cerradas después de las 18:00 UTC. ¡Vuelve mañana a las 00:00 UTC!' });
   }
 
@@ -3005,10 +3008,7 @@ app.post('/api/student/join', studentJoinLimiter, async (req, res) => {
   const captchaValid = await verifyHCaptcha(hCaptchaToken);
   if (!captchaValid) return res.status(400).json({ error: 'Captcha inválido' });
 
-  const now = new Date();
-  if (now.getUTCHours() >= 18) {
-    return res.status(400).json({ error: 'Inscripciones cerradas después de las 18:00 UTC. ¡Vuelve mañana!' });
-  }
+  // Modo estudiante: inscripción abierta las 24h, los 7 días de la semana
 
   try {
     let user = await prisma.user.findUnique({ where: { email } });
